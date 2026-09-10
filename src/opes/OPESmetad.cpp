@@ -1682,11 +1682,12 @@ inline double OPESmetad<mode>::evaluateKernel(const kernel& G,const std::vector<
       return 0;
     }
   }
-  const double val=G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
+  const double gaussian=G.height*std::exp(-0.5*norm2);
   for(unsigned i=0; i<ncv_; i++) {
-    acc_der[i]-=dist[i]/G.sigma[i]*val;  //NB: we accumulate the derivative into der
+    // The cutoff shift is constant and does not contribute to the derivative.
+    acc_der[i]-=dist[i]/G.sigma[i]*gaussian;
   }
-  return val;
+  return gaussian-G.height*val_at_cutoff_;
 }
 
 template <class mode>
