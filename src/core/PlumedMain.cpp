@@ -90,7 +90,8 @@ const std::set<std::string>& nonFiniteActionTraceLabels() {
       result.insert(label);
     }
     return result;
-  }();
+  }
+  ();
   return labels;
 }
 

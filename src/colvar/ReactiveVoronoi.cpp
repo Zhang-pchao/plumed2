@@ -726,7 +726,7 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::calculateAssignment() {
   if(numberOfThreads==1) {
     result.pairs.reserve(localPairCount);
     for(unsigned pairIndex=start; pairIndex<end; ++pairIndex) {
-      PairData pair={};
+      PairData pair= {};
       evaluatePair(pairIndex,0,pair);
       result.pairs.push_back(pair);
     }
@@ -784,8 +784,8 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::calculateAssignment() {
       }
     }
 
-    unsigned metadata[9]={0,0,0,0,0,0,0,0,0};
-    double details[19]={0.0};
+    unsigned metadata[9]= {0,0,0,0,0,0,0,0,0};
+    double details[19]= {0.0};
     if(communicatorRank==reportingRank &&
         selectedFailure.kind!=InvalidPairNone) {
       metadata[0]=static_cast<unsigned>(selectedFailure.kind);
