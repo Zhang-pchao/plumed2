@@ -47,11 +47,14 @@
 #include "lepton/Exception.h"
 #include "DataPassingTools.h"
 #include "small_vector/small_vector.h"
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <set>
 #include <exception>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <ios>
 #include <new>
@@ -69,6 +72,122 @@
 #include <filesystem>
 
 namespace PLMD {
+
+namespace {
+
+const std::set<std::string>& nonFiniteActionTraceLabels() {
+  static const std::set<std::string> labels=[]() {
+    std::set<std::string> result;
+    const char* environment=std::getenv("PLUMED_NONFINITE_ACTION_TRACE");
+    if(!environment) {
+      return result;
+    }
+    std::string selection(environment);
+    std::replace(selection.begin(),selection.end(),',',' ');
+    std::istringstream words(selection);
+    std::string label;
+    while(words >> label) {
+      result.insert(label);
+    }
+    return result;
+  }();
+  return labels;
+}
+
+bool traceActionSelected(const std::string& label) {
+  const std::set<std::string>& labels=nonFiniteActionTraceLabels();
+  return labels.count("*")>0 || labels.count(label)>0;
+}
+
+void traceActionNonFinite(const ActionSet& actions, const Action& trigger,
+                          const long long step, const char* phase,
+                          const bool checkValues, const bool checkForces) {
+  if(nonFiniteActionTraceLabels().empty()) {
+    return;
+  }
+  for(const auto& actionPointer : actions) {
+    Action* action=actionPointer.get();
+    // Forward data are only current after their owning action has run.
+    // Backward atom/box interface forces must also be checked: finite scalar
+    // forces and derivatives can overflow when multiplied or accumulated.
+    const bool interfaceForce=checkForces &&
+                              dynamic_cast<ActionForInterface*>(action);
+    if(!traceActionSelected(action->getLabel()) && !interfaceForce) {
+      continue;
+    }
+    if(checkValues && action!=&trigger) {
+      continue;
+    }
+    ActionWithValue* actionWithValue=action->castToActionWithValue();
+    if(!actionWithValue) {
+      continue;
+    }
+    for(unsigned component=0;
+        component<actionWithValue->getNumberOfComponents(); ++component) {
+      Value* value=actionWithValue->copyOutput(component);
+      const std::size_t numberOfValues=value->getNumberOfValues();
+      if(checkValues && value->valueHasBeenSet()) {
+        for(std::size_t element=0; element<numberOfValues; ++element) {
+          const double current=value->get(element);
+          if(std::isfinite(current)) {
+            continue;
+          }
+          std::ostringstream message;
+          message << std::setprecision(17)
+                  << "PLUMED action non-finite trace: step=" << step
+                  << " phase=" << phase
+                  << " after_action=" << trigger.getLabel()
+                  << " after_action_type=" << trigger.getName()
+                  << " target=" << value->getName()
+                  << " field=value element=" << element
+                  << " value=" << current;
+          plumed_merror(message.str());
+        }
+        // Scalar actions store a derivative array. Grid derivatives have a
+        // different layout and are deliberately not treated as scalar data.
+        if(value->hasDerivatives() && value->getRank()==0) {
+          for(unsigned derivative=0;
+              derivative<value->getNumberOfDerivatives(); ++derivative) {
+            const double current=value->getDerivative(derivative);
+            if(std::isfinite(current)) {
+              continue;
+            }
+            std::ostringstream message;
+            message << std::setprecision(17)
+                    << "PLUMED action non-finite trace: step=" << step
+                    << " phase=" << phase
+                    << " after_action=" << trigger.getLabel()
+                    << " after_action_type=" << trigger.getName()
+                    << " target=" << value->getName()
+                    << " field=derivative element=" << derivative
+                    << " value=" << current;
+            plumed_merror(message.str());
+          }
+        }
+      }
+      if(checkForces && value->forcesWereAdded()) {
+        for(std::size_t element=0; element<numberOfValues; ++element) {
+          const double current=value->getForce(element);
+          if(std::isfinite(current)) {
+            continue;
+          }
+          std::ostringstream message;
+          message << std::setprecision(17)
+                  << "PLUMED action non-finite trace: step=" << step
+                  << " phase=" << phase
+                  << " after_action=" << trigger.getLabel()
+                  << " after_action_type=" << trigger.getName()
+                  << " target=" << value->getName()
+                  << " field=force element=" << element
+                  << " value=" << current;
+          plumed_merror(message.str());
+        }
+      }
+    }
+  }
+}
+
+}
 
 /// Small utility just used in this file to throw arbitrary exceptions
 [[noreturn]] static void testThrow(const char* what) {
@@ -1331,6 +1450,8 @@ void PlumedMain::justCalculate() {
         } else {
           p->calculate();
         }
+        traceActionNonFinite(actionSet,*p,step,"forward",true,false);
+
         // This retrieves components called bias
         if(av) {
           bias+=av->getOutputQuantity("bias");
@@ -1388,6 +1509,7 @@ void PlumedMain::backwardPropagate() {
       }
 
       p->apply();
+      traceActionNonFinite(actionSet,*p,step,"backward",false,true);
     }
     iaction++;
   }
