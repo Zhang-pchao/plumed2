@@ -41,6 +41,7 @@
 !/molfile
 !/multicolvar
 !/opes
+!/pathbias
 !/python
 !/pamm
 !/piv
