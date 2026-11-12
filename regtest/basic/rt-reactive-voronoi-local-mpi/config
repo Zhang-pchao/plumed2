@@ -1,0 +1,4 @@
+type=make
+export PLUMED_STACK_TRACE=no
+mpiprocs=8
+extra_files="../rt-reactive-voronoi-local/local_checks.h"

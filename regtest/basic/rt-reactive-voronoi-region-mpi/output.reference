@@ -1,0 +1,10 @@
+PASS independent-signed-global-oracle
+PASS signed-decomposition-and-complete-derivatives
+PASS signed-monitor-only-zero-force
+PASS global-dense-sparse-cached-parity
+PASS escape-is-not-global-recombination
+PASS invalid-global-and-sign-input
+PASS global-missing-normalization-fails
+PASS sphere-slab-inside-outside-derivatives-and-parity
+PASS invalid-general-region-input
+PASS optional-wall-mobile-com-and-neutral-derivatives

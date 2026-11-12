@@ -1,0 +1,12 @@
+PASS independent-exponential-oracle
+PASS dense-sparse-cached-parity
+PASS atomic-anchor-and-strain-derivatives
+PASS region-entry-exit-host-exchange-and-empty-region
+PASS translation-and-pbc-images
+PASS center-and-assigned-permutation
+PASS nonperiodic-and-box-rebuild
+PASS serial-mode-parity
+PASS unsafe-normalization-fails-clearly
+PASS invalid-buffer-input-fails-clearly
+PASS monitor-only-value-and-zero-force
+PASS triclinic-images-and-rebuild
