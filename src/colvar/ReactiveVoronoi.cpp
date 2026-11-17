@@ -21,6 +21,8 @@
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 #include "Colvar.h"
 #include "core/ActionRegister.h"
+#include "core/ActionSet.h"
+#include "core/PlumedMain.h"
 #include "tools/Communicator.h"
 #include "tools/NeighborList.h"
 #include "tools/OpenMP.h"
@@ -31,6 +33,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -176,6 +179,21 @@ protected:
     std::vector<double> occupancy;
   };
 
+  struct SharedEvaluation {
+    bool valid=false;
+    long long step=0;
+    std::vector<Vector> positions;
+    Tensor box;
+    std::vector<PairData> geometry;
+    std::map<double,Assignment> assignments;
+  };
+  std::shared_ptr<SharedEvaluation> shared_;
+  bool noShare_=false;
+  unsigned long evaluations_=0, hits_=0, geometryHits_=0;
+  Assignment independent_;
+  bool sharedCoordinatesMatch() const;
+  Assignment computeAssignment();
+
   bool pbc_;
   bool serial_;
   bool invalidateList_;
@@ -205,7 +223,7 @@ protected:
                                      const std::string&, bool) const;
   bool neighborListNeedsUpdate();
   void saveNeighborListReference();
-  Assignment calculateAssignment();
+  const Assignment& calculateAssignment();
   std::vector<double> defects(const Assignment&) const;
   void addAssignmentDerivatives(const Assignment&, const std::vector<double>&,
                                 std::vector<Vector>&, Tensor&);
@@ -216,6 +234,7 @@ protected:
 public:
   explicit SoftVoronoiBase(const ActionOptions&);
   void prepare() override;
+  ~SoftVoronoiBase() override;
 };
 
 void SoftVoronoiBase::registerCommonKeywords(Keywords& keys) {
@@ -224,6 +243,7 @@ void SoftVoronoiBase::registerCommonKeywords(Keywords& keys) {
   keys.add("compulsory","KAPPA","Positive soft-assignment sharpness in inverse PLUMED length units");
   keys.add("compulsory","REFERENCE",
            "One intended occupancy broadcast to all CENTERS, or one value per CENTER in CENTERS order");
+  keys.addFlag("NO_SHARE",false,"Disable instance-local reuse of compatible assignment calculations");
   keys.addFlag("SERIAL",false,"Perform the calculation redundantly on each rank for debugging");
   keys.addFlag("NLIST",false,"Use an approximate neighbor-list truncation of the assignment candidates");
   keys.add("optional","NL_CUTOFF","Candidate cutoff in PLUMED length units; every ASSIGNED atom must retain at least one CENTER");
@@ -420,6 +440,7 @@ SoftVoronoiBase::SoftVoronoiBase(const ActionOptions& ao):
   parseVector("REFERENCE",reference_);
   broadcastOrCheck(reference_,centers_.size(),"REFERENCE");
 
+  parseFlag("NO_SHARE",noShare_);
   parseFlag("SERIAL",serial_);
   bool noPbc=false;
   parseFlag("NOPBC",noPbc);
@@ -505,6 +526,24 @@ std::vector<unsigned> SoftVoronoiBase::mapSelection(
 
 void SoftVoronoiBase::finishSetup(const std::string& displayName) {
   checkRead();
+  // Strided lists retain independent history until a shared owner is available.
+  if(!noShare_ && neighborList_->getStride()<=1) {
+    for(auto* other: plumed.getActionSet().select<SoftVoronoiBase*>()) {
+      if(other->shared_ && other->centers_==centers_ &&
+          other->assigned_==assigned_ && other->pbc_==pbc_ &&
+          other->serial_==serial_ && other->neighborCutoff_==neighborCutoff_ &&
+          other->neighborSkin_==neighborSkin_ &&
+          other->neighborList_->getStride()==neighborList_->getStride() &&
+          other->useCellList_==useCellList_) {
+        shared_=other->shared_;
+        log.printf("  sharing reactive Voronoi geometry with %s\n",other->getLabel().c_str());
+        break;
+      }
+    }
+    if(!shared_) {
+      shared_=std::make_shared<SharedEvaluation>();
+    }
+  }
   addValueWithDerivatives();
   setNotPeriodic();
   // PLUMED 2.8 needs the full atom list to preserve absolute-index mapping.
@@ -581,7 +620,63 @@ void SoftVoronoiBase::saveNeighborListReference() {
   haveNeighborReference_=true;
 }
 
-SoftVoronoiBase::Assignment SoftVoronoiBase::calculateAssignment() {
+SoftVoronoiBase::~SoftVoronoiBase() {
+  log.printf("  reactive Voronoi %s: assignments=%lu cache_hits=%lu geometry_hits=%lu\n",
+             getLabel().c_str(),evaluations_,hits_,geometryHits_);
+}
+
+bool SoftVoronoiBase::sharedCoordinatesMatch() const {
+  if(!shared_->valid || shared_->step!=getStep() ||
+      shared_->positions.size()!=getPositions().size()) {
+    return false;
+  }
+  const auto& positions=getPositions();
+  for(unsigned i=0; i<positions.size(); ++i) {
+    for(unsigned k=0; k<3; ++k) {
+      if(positions[i][k]!=shared_->positions[i][k]) {
+        return false;
+      }
+    }
+  }
+  const Tensor& box=getPbc().getBox();
+  for(unsigned i=0; i<3; ++i) {
+    for(unsigned j=0; j<3; ++j) {
+      if(box(i,j)!=shared_->box(i,j)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+const SoftVoronoiBase::Assignment& SoftVoronoiBase::calculateAssignment() {
+  if(!shared_) {
+    ++evaluations_;
+    independent_=computeAssignment();
+    return independent_;
+  }
+  if(!sharedCoordinatesMatch()) {
+    shared_->valid=false;
+    shared_->geometry.clear();
+    shared_->assignments.clear();
+    shared_->positions=getPositions();
+    shared_->box=getPbc().getBox();
+    shared_->step=getStep();
+  } else {
+    const auto found=shared_->assignments.find(kappa_);
+    if(found!=shared_->assignments.end()) {
+      ++hits_;
+      return found->second;
+    }
+  }
+  ++evaluations_;
+  Assignment result=computeAssignment();
+  auto inserted=shared_->assignments.emplace(kappa_,std::move(result));
+  shared_->valid=true;
+  return inserted.first->second;
+}
+
+SoftVoronoiBase::Assignment SoftVoronoiBase::computeAssignment() {
   // Refresh the buffered candidate list on schedule or after a safe-skin exit.
   if(neighborList_->getStride()>0) {
     const bool updateList=invalidateList_ || neighborListNeedsUpdate();
@@ -603,6 +698,11 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::calculateAssignment() {
   const double negativeInfinity=-std::numeric_limits<double>::infinity();
 
   Assignment result;
+  const bool reuseGeometry=shared_ && shared_->valid &&
+                           shared_->geometry.size()==localPairCount;
+  if(reuseGeometry) {
+    ++geometryHits_;
+  }
   unsigned numberOfThreads=1;
 #ifdef _OPENMP
   numberOfThreads=OpenMP::getGoodNumThreads(
@@ -690,15 +790,16 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::calculateAssignment() {
       recordFailure(boxFailure);
       return;
     }
-    pair.distance=pbc_ ?
-                  pbcDistance(centerPosition,assignedPosition) :
-                  delta(centerPosition,assignedPosition);
+    pair.distance=reuseGeometry ? shared_->geometry[pairIndex-start].distance :
+                  (pbc_ ? pbcDistance(centerPosition,assignedPosition) :
+                   delta(centerPosition,assignedPosition));
     displacementAvailable=true;
     if(!finiteVector(pair.distance)) {
       recordFailure(InvalidDisplacement);
       return;
     }
-    pair.length=pair.distance.modulo();
+    pair.length=reuseGeometry ? shared_->geometry[pairIndex-start].length :
+                pair.distance.modulo();
     lengthAvailable=true;
     if(!std::isfinite(pair.length)) {
       recordFailure(InvalidLength);
@@ -709,7 +810,7 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::calculateAssignment() {
       return;
     }
     if(filterCandidatePairs_ && pair.length>neighborCutoff_) {
-      pair.length=-1.0;
+      pair.score=std::numeric_limits<double>::quiet_NaN();
       return;
     }
     pair.score=-kappa_*pair.length;
@@ -840,11 +941,14 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::calculateAssignment() {
     error(invalidPairMessage(selectedFailure));
   }
 
+  if(shared_ && !reuseGeometry) {
+    shared_->geometry=result.pairs;
+  }
   if(filterCandidatePairs_) {
     result.pairs.erase(
       std::remove_if(result.pairs.begin(),result.pairs.end(),
     [](const PairData& pair) {
-      return pair.length<0.0;
+      return std::isnan(pair.score);
     }),result.pairs.end());
   }
   for(unsigned j=0; j<assigned_.size(); ++j) {
@@ -1448,7 +1552,7 @@ VoronoiCoordination::VoronoiCoordination(const ActionOptions& ao):
 }
 
 void VoronoiCoordination::calculate() {
-  const Assignment assignment=calculateAssignment();
+  const Assignment& assignment=calculateAssignment();
   const std::vector<double> defect=defects(assignment);
   std::vector<double> derivativeByDefect(centers_.size(),0.0);
   double value=0.0;
@@ -1745,7 +1849,7 @@ VoronoiDistance::VoronoiDistance(const ActionOptions& ao):
 }
 
 void VoronoiDistance::calculate() {
-  const Assignment assignment=calculateAssignment();
+  const Assignment& assignment=calculateAssignment();
   const std::vector<double> defect=defects(assignment);
   std::vector<double> derivativeByDefect(centers_.size(),0.0);
   std::vector<Vector> derivatives(getNumberOfAtoms());
@@ -2051,7 +2155,7 @@ VoronoiPosition::VoronoiPosition(const ActionOptions& ao):
 }
 
 void VoronoiPosition::calculate() {
-  const Assignment assignment=calculateAssignment();
+  const Assignment& assignment=calculateAssignment();
   const std::vector<double> defect=defects(assignment);
   std::vector<double> displacement(selected_.size(),0.0);
   std::vector<double> function(selected_.size(),0.0);
