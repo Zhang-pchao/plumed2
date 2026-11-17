@@ -20,6 +20,7 @@
    along with plumed.  If not, see <http://www.gnu.org/licenses/>.
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
 #include "Colvar.h"
+#include "ReactiveVoronoiCuda.h"
 #include "core/ActionRegister.h"
 #include "core/ActionSet.h"
 #include "core/PlumedMain.h"
@@ -177,6 +178,7 @@ protected:
   struct Assignment {
     std::vector<PairData> pairs;
     std::vector<double> occupancy;
+    std::shared_ptr<ReactiveVoronoiCuda> cuda;
   };
 
   struct SharedEvaluation {
@@ -186,11 +188,14 @@ protected:
     Tensor box;
     std::vector<PairData> geometry;
     std::map<double,Assignment> assignments;
+    std::map<double,std::shared_ptr<ReactiveVoronoiCuda>> cuda;
   };
   std::shared_ptr<SharedEvaluation> shared_;
   bool noShare_=false;
   unsigned long evaluations_=0, hits_=0, geometryHits_=0;
   Assignment independent_;
+  std::shared_ptr<ReactiveVoronoiCuda> independentCuda_;
+  std::string backend_="CPU", cudaLibrary_;
   bool sharedCoordinatesMatch() const;
   Assignment computeAssignment();
 
@@ -243,6 +248,8 @@ void SoftVoronoiBase::registerCommonKeywords(Keywords& keys) {
   keys.add("compulsory","KAPPA","Positive soft-assignment sharpness in inverse PLUMED length units");
   keys.add("compulsory","REFERENCE",
            "One intended occupancy broadcast to all CENTERS, or one value per CENTER in CENTERS order");
+  keys.add("compulsory","BACKEND","CPU","Assignment backend: CPU or experimental CUDA");
+  keys.add("optional","CUDA_LIBRARY","Explicit path of the optional FP64 CUDA backend shared library");
   keys.addFlag("NO_SHARE",false,"Disable instance-local reuse of compatible assignment calculations");
   keys.addFlag("SERIAL",false,"Perform the calculation redundantly on each rank for debugging");
   keys.addFlag("NLIST",false,"Use an approximate neighbor-list truncation of the assignment candidates");
@@ -440,6 +447,11 @@ SoftVoronoiBase::SoftVoronoiBase(const ActionOptions& ao):
   parseVector("REFERENCE",reference_);
   broadcastOrCheck(reference_,centers_.size(),"REFERENCE");
 
+  parse("BACKEND",backend_);
+  parse("CUDA_LIBRARY",cudaLibrary_);
+  if(backend_!="CPU" && backend_!="CUDA") error("BACKEND must be CPU or CUDA");
+  if(backend_=="CUDA" && (cudaLibrary_.empty() || comm.Get_size()!=1))
+    error("CUDA prototype requires CUDA_LIBRARY and a single MPI rank");
   parseFlag("NO_SHARE",noShare_);
   parseFlag("SERIAL",serial_);
   bool noPbc=false;
@@ -451,6 +463,7 @@ SoftVoronoiBase::SoftVoronoiBase(const ActionOptions& ao):
   double neighborSkin=0.0;
   int neighborStride=0;
   parseFlag("NLIST",useNeighborList);
+  if(useNeighborList && backend_=="CUDA") error("CUDA prototype currently requires complete pairs (no NLIST)");
   if(useNeighborList) {
     parse("NL_CUTOFF",neighborCutoff);
     parse("NL_STRIDE",neighborStride);
@@ -531,7 +544,8 @@ void SoftVoronoiBase::finishSetup(const std::string& displayName) {
     for(auto* other: plumed.getActionSet().select<SoftVoronoiBase*>()) {
       if(other->shared_ && other->centers_==centers_ &&
           other->assigned_==assigned_ && other->pbc_==pbc_ &&
-          other->serial_==serial_ && other->neighborCutoff_==neighborCutoff_ &&
+          other->serial_==serial_ && other->backend_==backend_ &&
+          other->cudaLibrary_==cudaLibrary_ && other->neighborCutoff_==neighborCutoff_ &&
           other->neighborSkin_==neighborSkin_ &&
           other->neighborList_->getStride()==neighborList_->getStride() &&
           other->useCellList_==useCellList_) {
@@ -677,6 +691,27 @@ const SoftVoronoiBase::Assignment& SoftVoronoiBase::calculateAssignment() {
 }
 
 SoftVoronoiBase::Assignment SoftVoronoiBase::computeAssignment() {
+  if(backend_=="CUDA") {
+    const Tensor box=getPbc().getBox();
+    double diagonal[3];
+    for(unsigned i=0;i<3;++i) {
+      diagonal[i]=box(i,i);
+      if(pbc_ && (!std::isfinite(diagonal[i]) || diagonal[i]<=0))
+        error("CUDA requires a finite positive orthorhombic box");
+      for(unsigned j=0;j<3;++j)
+        if(pbc_ && i!=j && box(i,j)!=0) error("CUDA prototype supports orthorhombic PBC or NOPBC");
+    }
+    auto& context=shared_ ? shared_->cuda[kappa_] : independentCuda_;
+    if(!context) context=std::make_shared<ReactiveVoronoiCuda>(cudaLibrary_,centers_.size(),assigned_.size());
+    Assignment result;
+    result.cuda=context;
+    result.occupancy.resize(centers_.size());
+    std::vector<double> positions(3*getPositions().size());
+    for(unsigned i=0;i<getPositions().size();++i)
+      for(unsigned k=0;k<3;++k) positions[3*i+k]=getPosition(i)[k];
+    context->forward(positions.data(),diagonal,pbc_,kappa_,result.occupancy.data());
+    return result;
+  }
   // Refresh the buffered candidate list on schedule or after a safe-skin exit.
   if(neighborList_->getStride()>0) {
     const bool updateList=invalidateList_ || neighborListNeedsUpdate();
@@ -1042,6 +1077,16 @@ void SoftVoronoiBase::addAssignmentDerivatives(
     error("internal defect derivative has the wrong size");
   }
 
+  if(assignment.cuda) {
+    std::vector<double> gradient(3*derivatives.size());
+    double boxGradient[9];
+    assignment.cuda->backward(derivativeByDefect.data(),gradient.data(),boxGradient);
+    for(unsigned i=0;i<derivatives.size();++i)
+      for(unsigned k=0;k<3;++k) derivatives[i][k]+=gradient[3*i+k];
+    for(unsigned i=0;i<3;++i)
+      for(unsigned j=0;j<3;++j) virial(i,j)+=boxGradient[3*i+j];
+    return;
+  }
   unsigned numberOfThreads=1;
 #ifdef _OPENMP
   numberOfThreads=OpenMP::getGoodNumThreads(assignment.pairs);
