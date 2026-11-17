@@ -182,6 +182,9 @@ protected:
   };
 
   struct SharedEvaluation {
+    unsigned consumers=1;
+    double firstKappa=0;
+    bool mixedKappa=false;
     bool valid=false;
     long long step=0;
     std::vector<Vector> positions;
@@ -553,6 +556,8 @@ void SoftVoronoiBase::finishSetup(const std::string& displayName) {
           other->neighborList_->getStride()==neighborList_->getStride() &&
           other->useCellList_==useCellList_) {
         shared_=other->shared_;
+        ++shared_->consumers;
+        shared_->mixedKappa=shared_->mixedKappa || shared_->firstKappa!=kappa_;
         neighborList_=other->neighborList_;
         log.printf("  sharing reactive Voronoi geometry with %s\n",other->getLabel().c_str());
         break;
@@ -560,6 +565,7 @@ void SoftVoronoiBase::finishSetup(const std::string& displayName) {
     }
     if(!shared_) {
       shared_=std::make_shared<SharedEvaluation>();
+      shared_->firstKappa=kappa_;
     }
   }
   addValueWithDerivatives();
@@ -675,7 +681,7 @@ bool SoftVoronoiBase::sharedCoordinatesMatch() const {
 }
 
 const SoftVoronoiBase::Assignment& SoftVoronoiBase::calculateAssignment() {
-  if(!shared_) {
+  if(!shared_ || shared_->consumers==1) {
     ++evaluations_;
     independent_=computeAssignment();
     return independent_;
@@ -987,7 +993,7 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::computeAssignment() {
     error(invalidPairMessage(selectedFailure));
   }
 
-  if(shared_ && !reuseGeometry) {
+  if(shared_ && shared_->mixedKappa && !reuseGeometry) {
     shared_->geometry=result.pairs;
   }
   if(filterCandidatePairs_) {
