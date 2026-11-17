@@ -189,6 +189,9 @@ protected:
     std::vector<PairData> geometry;
     std::map<double,Assignment> assignments;
     std::map<double,std::shared_ptr<ReactiveVoronoiCuda>> cuda;
+    bool haveNeighborReference=false;
+    std::vector<Vector> neighborReferencePositions;
+    Tensor neighborReferenceBox;
   };
   std::shared_ptr<SharedEvaluation> shared_;
   bool noShare_=false;
@@ -209,7 +212,7 @@ protected:
   double kappa_;
   double neighborCutoff_;
   double neighborSkin_;
-  std::unique_ptr<NeighborList> neighborList_;
+  std::shared_ptr<NeighborList> neighborList_;
   std::vector<AtomNumber> centers_;
   std::vector<AtomNumber> assigned_;
   std::vector<double> reference_;
@@ -539,8 +542,8 @@ std::vector<unsigned> SoftVoronoiBase::mapSelection(
 
 void SoftVoronoiBase::finishSetup(const std::string& displayName) {
   checkRead();
-  // Strided lists retain independent history until a shared owner is available.
-  if(!noShare_ && neighborList_->getStride()<=1) {
+  // Compatible actions share the candidate-list history as well as each evaluation.
+  if(!noShare_) {
     for(auto* other: plumed.getActionSet().select<SoftVoronoiBase*>()) {
       if(other->shared_ && other->centers_==centers_ &&
           other->assigned_==assigned_ && other->pbc_==pbc_ &&
@@ -550,6 +553,7 @@ void SoftVoronoiBase::finishSetup(const std::string& displayName) {
           other->neighborList_->getStride()==neighborList_->getStride() &&
           other->useCellList_==useCellList_) {
         shared_=other->shared_;
+        neighborList_=other->neighborList_;
         log.printf("  sharing reactive Voronoi geometry with %s\n",other->getLabel().c_str());
         break;
       }
@@ -592,18 +596,21 @@ void SoftVoronoiBase::prepare() {
 }
 
 bool SoftVoronoiBase::neighborListNeedsUpdate() {
-  if(neighborSkin_<=0.0 || !haveNeighborReference_) {
+  const bool haveReference=shared_ ? shared_->haveNeighborReference : haveNeighborReference_;
+  const auto& referencePositions=shared_ ? shared_->neighborReferencePositions : neighborReferencePositions_;
+  const Tensor& referenceBox=shared_ ? shared_->neighborReferenceBox : neighborReferenceBox_;
+  if(neighborSkin_<=0.0 || !haveReference) {
     return false;
   }
   const std::vector<Vector>& positions=getPositions();
-  if(positions.size()!=neighborReferencePositions_.size()) {
+  if(positions.size()!=referencePositions.size()) {
     return true;
   }
   if(pbc_) {
     const Tensor box=getPbc().getBox();
     for(unsigned i=0; i<3; ++i) {
       for(unsigned j=0; j<3; ++j) {
-        if(box(i,j)!=neighborReferenceBox_(i,j)) {
+        if(box(i,j)!=referenceBox(i,j)) {
           return true;
         }
       }
@@ -612,9 +619,9 @@ bool SoftVoronoiBase::neighborListNeedsUpdate() {
   const double thresholdSquared=0.25*neighborSkin_*neighborSkin_;
   for(unsigned i=0; i<positions.size(); ++i) {
     const Vector displacement=pbc_ ?
-                              pbcDistance(neighborReferencePositions_[i],
+                              pbcDistance(referencePositions[i],
                                           positions[i]) :
-                              delta(neighborReferencePositions_[i],
+                              delta(referencePositions[i],
                                     positions[i]);
     if(displacement.modulo2()>thresholdSquared) {
       return true;
@@ -627,11 +634,15 @@ void SoftVoronoiBase::saveNeighborListReference() {
   if(neighborSkin_<=0.0) {
     return;
   }
-  neighborReferencePositions_=getPositions();
-  if(pbc_) {
-    neighborReferenceBox_=getPbc().getBox();
+  if(shared_) {
+    shared_->neighborReferencePositions=getPositions();
+    if(pbc_) shared_->neighborReferenceBox=getPbc().getBox();
+    shared_->haveNeighborReference=true;
+  } else {
+    neighborReferencePositions_=getPositions();
+    if(pbc_) neighborReferenceBox_=getPbc().getBox();
+    haveNeighborReference_=true;
   }
-  haveNeighborReference_=true;
 }
 
 SoftVoronoiBase::~SoftVoronoiBase() {
@@ -713,7 +724,7 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::computeAssignment() {
     return result;
   }
   // Refresh the buffered candidate list on schedule or after a safe-skin exit.
-  if(neighborList_->getStride()>0) {
+  if(neighborList_->getStride()>0 && !(shared_ && shared_->valid)) {
     const bool updateList=invalidateList_ || neighborListNeedsUpdate();
     if(updateList) {
       neighborList_->update(getPositions());
