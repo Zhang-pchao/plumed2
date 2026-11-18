@@ -19,7 +19,7 @@
    You should have received a copy of the GNU Lesser General Public License
    along with plumed.  If not, see <http://www.gnu.org/licenses/>.
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
-#include "plumed/wrapper/Plumed.h"
+#include <plumed/wrapper/Plumed.h>
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 #include <array>
