@@ -34,6 +34,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <map>
 #include <set>
 #include <sstream>
@@ -181,6 +182,13 @@ protected:
     std::shared_ptr<ReactiveVoronoiCuda> cuda;
   };
 
+  struct CudaNeighbors {
+    // The offsets index centers grouped by assigned atom.
+    std::vector<int> offsets;
+    std::vector<int> centers;
+    unsigned long version=0;
+  };
+
   struct SharedEvaluation {
     unsigned consumers=1;
     double firstKappa=0;
@@ -192,6 +200,7 @@ protected:
     std::vector<PairData> geometry;
     std::map<double,Assignment> assignments;
     std::map<double,std::shared_ptr<ReactiveVoronoiCuda>> cuda;
+    CudaNeighbors cudaNeighbors;
     bool haveNeighborReference=false;
     std::vector<Vector> neighborReferencePositions;
     Tensor neighborReferenceBox;
@@ -201,6 +210,7 @@ protected:
   unsigned long evaluations_=0, hits_=0, geometryHits_=0;
   Assignment independent_;
   std::shared_ptr<ReactiveVoronoiCuda> independentCuda_;
+  CudaNeighbors independentCudaNeighbors_;
   std::string backend_="CPU", cudaLibrary_;
   std::string autoCudaFailure_;
   std::string lastBackendMessage_;
@@ -208,6 +218,7 @@ protected:
   std::shared_ptr<ReactiveVoronoiCuda> cudaContext();
   bool sharedCoordinatesMatch() const;
   Assignment computeAssignment();
+  void packCudaNeighbors(CudaNeighbors&);
 
   bool pbc_;
   bool serial_;
@@ -483,9 +494,6 @@ SoftVoronoiBase::SoftVoronoiBase(const ActionOptions& ao):
   double neighborSkin=0.0;
   int neighborStride=0;
   parseFlag("NLIST",useNeighborList);
-  if(useNeighborList && backend_=="CUDA") {
-    error("CUDA prototype currently requires complete pairs (no NLIST)");
-  }
   if(useNeighborList) {
     parse("NL_CUTOFF",neighborCutoff);
     parse("NL_STRIDE",neighborStride);
@@ -745,8 +753,6 @@ std::shared_ptr<ReactiveVoronoiCuda> SoftVoronoiBase::cudaContext() {
   std::string unsupported;
   if(comm.Get_size()!=1) {
     unsupported="multiple MPI ranks";
-  } else if(neighborCutoff_>0) {
-    unsupported="NLIST requires the CPU backend";
   } else if(pbc_) {
     const Tensor& box=getPbc().getBox();
     for(unsigned i=0; i<3; ++i) {
@@ -775,7 +781,7 @@ std::shared_ptr<ReactiveVoronoiCuda> SoftVoronoiBase::cudaContext() {
   if(!context) {
     try {
       context=std::make_shared<ReactiveVoronoiCuda>(
-                cudaLibrary_,centers_.size(),assigned_.size(),plumed.getGpuDeviceId());
+                cudaLibrary_,centers_.size(),assigned_.size(),plumed.getGpuDeviceId(),neighborCutoff_>0);
     } catch(const std::exception& failure) {
       if(backend_=="CUDA") {
         error(std::string("CUDA initialization failed: ")+failure.what());
@@ -788,12 +794,45 @@ std::shared_ptr<ReactiveVoronoiCuda> SoftVoronoiBase::cudaContext() {
   const std::string device=context->device()>=0 ?
                            "device "+std::to_string(context->device()) :
                            "current device (legacy backend library)";
-  logBackend("CUDA",device+"; assignment and assignment derivatives");
+  logBackend("CUDA",device+(neighborCutoff_>0 ? "; NLIST assignment and assignment derivatives" :
+                            "; assignment and assignment derivatives"));
   return context;
+}
+
+void SoftVoronoiBase::packCudaNeighbors(CudaNeighbors& neighbors) {
+  const auto count=neighborList_->size();
+  if(count>static_cast<unsigned>(std::numeric_limits<int>::max())) {
+    error("CUDA NLIST exceeds the supported number of candidate pairs");
+  }
+  neighbors.offsets.assign(assigned_.size()+1,0);
+  for(unsigned p=0; p<count; ++p) {
+    const auto pair=neighborList_->getClosePair(p);
+    if(pair.first>=centers_.size() || pair.second<centers_.size() ||
+        pair.second-centers_.size()>=assigned_.size()) {
+      error("internal CUDA NLIST pair mapping is invalid");
+    }
+    ++neighbors.offsets[pair.second-centers_.size()+1];
+  }
+  std::partial_sum(neighbors.offsets.begin(),neighbors.offsets.end(),neighbors.offsets.begin());
+  auto cursor=neighbors.offsets;
+  neighbors.centers.resize(count);
+  for(unsigned p=0; p<count; ++p) {
+    const auto pair=neighborList_->getClosePair(p);
+    neighbors.centers[cursor[pair.second-centers_.size()]++]=pair.first;
+  }
 }
 
 SoftVoronoiBase::Assignment SoftVoronoiBase::computeAssignment() {
   const auto context=cudaContext();
+  auto& neighbors=shared_ ? shared_->cudaNeighbors : independentCudaNeighbors_;
+  // CPU and CUDA use the same rebuild and safe-skin criteria.
+  if(neighborList_->getStride()>0 && !(shared_ && shared_->valid) &&
+      (invalidateList_ || neighborListNeedsUpdate())) {
+    neighborList_->update(getPositions());
+    saveNeighborListReference();
+    ++neighbors.version;
+    neighbors.offsets.clear();
+  }
   if(context) {
     const Tensor& box=getPbc().getBox();
     double diagonal[3];
@@ -811,18 +850,19 @@ SoftVoronoiBase::Assignment SoftVoronoiBase::computeAssignment() {
     }
     // Calculation failures propagate for both CUDA and AUTO. Invalid geometry
     // must remain an error after a backend has been successfully initialized.
-    context->forward(positions.data(),diagonal,pbc_,kappa_,result.occupancy.data());
+    if(neighborCutoff_>0) {
+      if(neighbors.offsets.empty()) {
+        packCudaNeighbors(neighbors);
+      }
+      const double cutoff=filterCandidatePairs_ ? neighborCutoff_ :
+                          std::numeric_limits<double>::infinity();
+      context->forwardNeighbors(positions.data(),diagonal,pbc_,kappa_,result.occupancy.data(),
+                                cutoff,neighbors.offsets,neighbors.centers,neighbors.version);
+    } else {
+      context->forward(positions.data(),diagonal,pbc_,kappa_,result.occupancy.data());
+    }
     return result;
   }
-  // Refresh the buffered candidate list on schedule or after a safe-skin exit.
-  if(neighborList_->getStride()>0 && !(shared_ && shared_->valid)) {
-    const bool updateList=invalidateList_ || neighborListNeedsUpdate();
-    if(updateList) {
-      neighborList_->update(getPositions());
-      saveNeighborListReference();
-    }
-  }
-
   // Split candidate pairs into contiguous MPI-owned ranges.
   const unsigned numberOfPairs=neighborList_->size();
   const unsigned stride=serial_ ? 1 : comm.Get_size();
@@ -1510,7 +1550,8 @@ BACKEND=AUTO selects a compatible available backend and logs the choice.
 CUDA_LIBRARY supplies its path; the default library name on Linux is
 libReactiveVoronoiCuda.so. The CUDA implementation currently supports complete
 exponential assignments, one MPI rank, orthorhombic PBC and NOPBC. AUTO uses
-CPU for NLIST, triclinic boxes or multiple MPI ranks. OPES, scalar reductions
+CPU for triclinic boxes or multiple MPI ranks. CUDA NLIST reuses the
+CPU-built candidate list and applies the same cutoff each evaluation. OPES, scalar reductions
 and direct distance/position terms execute on CPU.
 
 The plugin README describes compilation, device selection and examples.

@@ -28,6 +28,7 @@
 #endif
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace PLMD {
 namespace colvar {
@@ -38,15 +39,19 @@ class ReactiveVoronoiCuda {
   void* library_=nullptr;
   void* state_=nullptr;
   int device_=-1;
+  unsigned long uploadedNeighborVersion_=0;
   using Create=void*(*)(int,int);
   using CreateOnDevice=void*(*)(int,int,int);
   using Destroy=void(*)(void*);
   using Forward=int(*)(void*,const double*,const double*,int,double,double*);
+  using ForwardNeighbors=int(*)(void*,const double*,const double*,int,double,double*,
+                                double,const int*,const int*,int);
   using Backward=int(*)(void*,const double*,double*,double*);
   using Device=int(*)(void*);
   using DeviceCount=int(*)();
   Destroy destroy_=nullptr;
   Forward forward_=nullptr;
+  ForwardNeighbors forwardNeighbors_=nullptr;
   Backward backward_=nullptr;
 
   template<class Function>
@@ -66,7 +71,7 @@ class ReactiveVoronoiCuda {
 
 public:
   ReactiveVoronoiCuda(const std::string& path, int centers, int assigned,
-                      int mdDevice=-1) {
+                      int mdDevice=-1, bool needsNeighbors=false) {
     if(!DLLoader::installed()) {
       throw std::runtime_error("Dynamic loading is unavailable in this PLUMED build");
     }
@@ -77,6 +82,12 @@ public:
     const auto device=symbol<Device>("reactive_voronoi_device_v1",false);
     destroy_=symbol<Destroy>("reactive_voronoi_destroy_v1");
     forward_=symbol<Forward>("reactive_voronoi_forward_v1");
+    if(needsNeighbors) {
+      forwardNeighbors_=symbol<ForwardNeighbors>("reactive_voronoi_forward_nlist_v1",false);
+      if(!forwardNeighbors_) {
+        throw std::runtime_error("The CUDA library does not support NLIST");
+      }
+    }
     backward_=symbol<Backward>("reactive_voronoi_backward_v1");
     if(deviceCount && deviceCount()==0) {
       throw std::runtime_error("No CUDA device is available");
@@ -111,6 +122,24 @@ public:
     if(forward_(state_,positions,box,pbc,kappa,occupancy)!=0) {
       throw std::runtime_error("CUDA reactive Voronoi forward failed; check geometry and CUDA diagnostics");
     }
+  }
+
+  void forwardNeighbors(const double* positions, const double* box, bool pbc,
+                        double kappa, double* occupancy, double cutoff,
+                        const std::vector<int>& offsets, const std::vector<int>& centers,
+                        unsigned long version) {
+    const bool upload=uploadedNeighborVersion_!=version;
+    const int status=forwardNeighbors_(state_,positions,box,pbc,kappa,occupancy,cutoff,
+                                       upload ? offsets.data() : nullptr,
+                                       upload ? centers.data() : nullptr,
+                                       upload ? static_cast<int>(centers.size()) : 0);
+    if(status==2) {
+      throw std::runtime_error("an ASSIGNED atom has no CENTER inside the candidate list");
+    }
+    if(status!=0) {
+      throw std::runtime_error("CUDA reactive Voronoi NLIST forward failed; check geometry and CUDA diagnostics");
+    }
+    uploadedNeighborVersion_=version;
   }
 
   void backward(const double* sensitivity, double* derivatives, double* virial) {

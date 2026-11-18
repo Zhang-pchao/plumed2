@@ -108,11 +108,11 @@ def main():
     for geometry in ["pbc", "nopbc", "nlist", "triclinic"]:
         reference = None
         for mode, backend in modes.items():
-            if mode == "cuda" and geometry in ["nlist", "triclinic"]:
+            if mode == "cuda" and geometry == "triclinic":
                 continue
             extra = " NOPBC" if geometry == "nopbc" else ""
             if geometry == "nlist":
-                extra = " NLIST NL_CUTOFF=6 NL_STRIDE=3 NL_SKIN=0.4"
+                extra = " NLIST NL_CUTOFF=1.85 NL_STRIDE=3 NL_SKIN=0.4"
             labels = ["v" + str(index) for index in range(len(definitions))]
             lines = [
                 label + ": " + definition + extra + backend
@@ -134,9 +134,9 @@ def main():
                 reference = data
             errors = {key: compare(reference[key], data[key]) for key in data}
             log = (directory / "stdout.log").read_text()
-            if mode == "auto" and geometry in ["nlist", "triclinic"]:
+            if mode == "auto" and geometry == "triclinic":
                 assert "selected CPU" in log
-            if mode in ["cuda", "auto"] and geometry in ["pbc", "nopbc"]:
+            if mode in ["cuda", "auto"] and geometry != "triclinic":
                 assert "selected CUDA" in log
             results["positive"].append(
                 dict(geometry=geometry, mode=mode, errors=errors)
@@ -225,8 +225,8 @@ def main():
         for name, suffix, box in [
             ("missing-library", " CUDA_LIBRARY=missing-backend.so", "7,8,9"),
             (
-                "strict-nlist",
-                " CUDA_LIBRARY=" + arguments.library + " NLIST NL_CUTOFF=6 NL_STRIDE=3",
+                "empty-nlist",
+                " CUDA_LIBRARY=" + arguments.library + " NLIST NL_CUTOFF=0.02 NL_STRIDE=3",
                 "7,8,9",
             ),
             (
@@ -241,6 +241,10 @@ def main():
             ]
             directory, code = run(name, lines, box=box)
             assert code != 0, directory
+            if name == "empty-nlist":
+                assert "no CENTER inside the candidate list" in (
+                    directory / "stdout.log"
+                ).read_text()
             results["negative"].append(dict(case=name, returncode=code))
     results["status"] = "PASSED"
     (work / "RESULTS.json").write_text(json.dumps(results, indent=2) + "\n")

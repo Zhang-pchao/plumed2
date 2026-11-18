@@ -47,10 +47,21 @@ An initialization fallback persists for the action's lifetime. Changes between
 orthorhombic and triclinic boxes select a compatible backend on each request.
 Calculation errors after successful CUDA initialization propagate normally.
 
-The currently supported CUDA domain is complete exponential assignments,
-one MPI rank, axis-aligned orthorhombic PBC, and NOPBC. AUTO uses CPU for
-NLIST, triclinic PBC and multiple MPI ranks. CPU retains these capabilities.
-The regional compact-kernel action has its own implementation.
+The currently supported CUDA domain is orthorhombic PBC or NOPBC and a
+single rank, with either complete assignments or NLIST. AUTO falls back to
+CPU for triclinic PBC and multiple MPI ranks. Older CUDA libraries still
+support complete assignments, and AUTO uses CPU if their NLIST symbol is
+missing.
+
+NLIST uses the same CPU-built candidate list and cutoff in both backends.
+CUDA uploads the candidate list after each rebuild and reuses the uploaded
+indices between evaluations. With a skin, CUDA filters the candidates
+against the exact cutoff at every evaluation. The center-distance reduction
+for VORONOI_DISTANCE remains on the host. NLIST renormalizes over the
+retained centers, so check both CVs and forces against complete assignments
+when choosing NL_CUTOFF. NL_STRIDE=1 rebuilds the candidates each step.
+For longer strides use a positive NL_SKIN to enable displacement-triggered
+rebuilds.
 
 ## Building the optional library
 

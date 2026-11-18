@@ -147,16 +147,21 @@ int main(int argc,char** argv) {
   for(const auto& specification: cases) {
     for(const std::string mode: {
           "", " NOPBC",
-          " NLIST NL_CUTOFF=6 NL_STRIDE=3 NL_SKIN=0.4"
+          " NLIST NL_CUTOFF=1.85 NL_STRIDE=3 NL_SKIN=0.4",
+          " NOPBC NLIST NL_CUTOFF=1.85 NL_STRIDE=1"
         }) {
-      if(strictCuda &&
-          (mode.find("NLIST")!=std::string::npos || specification.triclinic)) {
+      if(strictCuda && specification.triclinic && mode.find("NOPBC")==std::string::npos) {
         continue;
       }
       System candidate(specification,true,mode,backend,identifier++,legacy);
       System reference(specification,false,mode,"",identifier++,legacy);
       for(unsigned frame=0; frame<6; ++frame) {
         candidate.positions[12]+=0.003;
+        if(mode.find("NL_SKIN")!=std::string::npos && frame==1) {
+          // Bring a buffered-out center into the cutoff on the same step.
+          candidate.positions[12]+=0.7;
+          candidate.positions[13]+=0.8;
+        }
         candidate.box[0]+=0.002;
         reference.positions=candidate.positions;
         reference.box=candidate.box;
