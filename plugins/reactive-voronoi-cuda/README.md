@@ -135,6 +135,16 @@ installation. Run the CUDA cases on a CUDA-capable device.
 make CUDA_ARCH=sm_70 check PLUMED=/absolute/path/bin/plumed
 ~~~
 
+The driver matrix includes a fixed-box trajectory that forces a rebuild
+before the scheduled step. It compares values and derivatives to an
+independent CPU list rebuilt every step. It also checks invalid stride/skin
+inputs and pinpoints failed comparisons by file, row and column.
+Run the CPU and missing-library fallback cases on a CPU-only host with:
+
+~~~bash
+python3 regtest/backend_checks.py --plumed /absolute/path/bin/plumed --cpu-only
+~~~
+
 In a configured PLUMED source build, the native CPU regression is available
 through PLUMED's test harness.
 

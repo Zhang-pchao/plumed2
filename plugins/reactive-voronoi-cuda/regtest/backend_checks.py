@@ -18,15 +18,22 @@ def read_numbers(path):
     return rows
 
 
-def compare(reference, candidate):
-    assert len(reference) == len(candidate)
+def compare(reference, candidate, location):
+    assert len(reference) == len(candidate), location
     maximum = 0.0
-    for left, right in zip(reference, candidate):
-        assert len(left) == len(right)
-        for expected, actual in zip(left, right):
-            assert math.isfinite(actual)
+    for row, (left, right) in enumerate(zip(reference, candidate)):
+        assert len(left) == len(right), (location, row)
+        for column, (expected, actual) in enumerate(zip(left, right)):
+            assert math.isfinite(actual), (location, row, column, actual)
             error = abs(expected - actual)
-            assert error <= 2e-8 + 2e-10 * abs(expected), (expected, actual, error)
+            assert error <= 2e-8 + 2e-10 * abs(expected), (
+                location,
+                row,
+                column,
+                expected,
+                actual,
+                error,
+            )
             maximum = max(maximum, error)
     return maximum
 
@@ -34,10 +41,12 @@ def compare(reference, candidate):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--plumed", default="plumed")
-    parser.add_argument("--library", required=True)
+    parser.add_argument("--library")
     parser.add_argument("--work", type=Path)
     parser.add_argument("--cpu-only", action="store_true")
     arguments = parser.parse_args()
+    if not arguments.cpu_only and not arguments.library:
+        parser.error("--library is required unless --cpu-only is set")
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     work = arguments.work or Path(tempfile.mkdtemp(prefix="voronoi-backends-"))
     work.mkdir(parents=True, exist_ok=True)
@@ -81,13 +90,16 @@ def main():
         )
     results = {"work": str(work), "positive": [], "negative": []}
 
-    def run(name, lines, coordinates=None, box="7,8,9"):
+    def run(name, lines, coordinates=None, box="7,8,9", frames=None):
         directory = work / name
         directory.mkdir()
-        coordinates = coordinates or positions
-        xyz = "10\nsmall backend regression\n"
-        xyz += "\n".join("H " + " ".join(map(str, row)) for row in coordinates) + "\n"
-        (directory / "frame.xyz").write_text(xyz)
+        if frames is None:
+            frames = [coordinates if coordinates is not None else positions]
+        with (directory / "frame.xyz").open("w") as xyz:
+            for frame in frames:
+                xyz.write(f"{len(frame)}\nsmall backend regression\n")
+                for row in frame:
+                    xyz.write("H " + " ".join(map(str, row)) + "\n")
         (directory / "plumed.dat").write_text("\n".join(lines) + "\n")
         command = [
             arguments.plumed,
@@ -132,7 +144,9 @@ def main():
             }
             if reference is None:
                 reference = data
-            errors = {key: compare(reference[key], data[key]) for key in data}
+            errors = {
+                key: compare(reference[key], data[key], directory / key) for key in data
+            }
             log = (directory / "stdout.log").read_text()
             if mode == "auto" and geometry == "triclinic":
                 assert "selected CPU" in log
@@ -142,7 +156,57 @@ def main():
                 dict(geometry=geometry, mode=mode, errors=errors)
             )
 
+    # Keep the box fixed. The second center is outside the initial buffered
+    # list and enters the true cutoff before the scheduled rebuild at step 10.
+    # The following frame moves below half the skin and reuses the new list.
+    frames = [
+        [[0, 0, 0], [1.8, 0, 0], [4, 0, 0], [x, 0.1, 0], [4.3, 0.1, 0]]
+        for x in (0.20, 0.95, 0.96, 1.55)
+    ]
+    buffered = " CENTERS=1,2,3 ASSIGNED=4,5 REFERENCE=1 KAPPA=5 NLIST NL_CUTOFF=1.2"
+    reference = None
+    for mode, backend in modes.items():
+        is_reference = mode == "independent"
+        suffix = " NL_STRIDE=1" if is_reference else " NL_STRIDE=10 NL_SKIN=0.25"
+        suffix += backend
+        lines = [
+            "q: VORONOI_COORDINATION SELECT=1 POWER=2" + buffered + suffix,
+            "d: VORONOI_DISTANCE GROUP1=1,2,3" + buffered + suffix,
+            "PRINT ARG=q,d FILE=values FMT=%24.16e",
+            "DUMPDERIVATIVES ARG=q,d FILE=derivatives FMT=%24.16e",
+        ]
+        directory, code = run("displacement-rebuild-" + mode, lines, frames=frames)
+        assert code == 0, directory
+        data = {key: read_numbers(directory / key) for key in ("values", "derivatives")}
+        assert len(data["values"]) == len(frames), directory
+        if is_reference:
+            reference = data
+            assert abs(data["values"][1][1] - data["values"][0][1]) > 0.05, directory
+        errors = {
+            key: compare(reference[key], data[key], directory / key) for key in data
+        }
+        log = (directory / "stdout.log").read_text()
+        expected = "selected CUDA" if mode in ("cuda", "auto") else "selected CPU"
+        assert expected in log, directory
+        if mode in ("cuda", "auto"):
+            assert "NLIST assignment and assignment derivatives" in log, directory
+        results["positive"].append(
+            dict(geometry="displacement-rebuild", mode=mode, errors=errors)
+        )
+
     invalid = [
+        (
+            "nlist-missing-stride",
+            "VORONOI_COORDINATION " + common + " NLIST NL_CUTOFF=1.85 NL_SKIN=0.4",
+            "NL_STRIDE must be positive",
+        ),
+        (
+            "nlist-skin-with-unit-stride",
+            "VORONOI_COORDINATION "
+            + common
+            + " NLIST NL_CUTOFF=1.85 NL_STRIDE=1 NL_SKIN=0.4",
+            "NL_SKIN requires NL_STRIDE greater than one",
+        ),
         (
             "bad-kappa",
             "VORONOI_COORDINATION " + common.replace("KAPPA=5", "KAPPA=0"),
@@ -226,7 +290,9 @@ def main():
             ("missing-library", " CUDA_LIBRARY=missing-backend.so", "7,8,9"),
             (
                 "empty-nlist",
-                " CUDA_LIBRARY=" + arguments.library + " NLIST NL_CUTOFF=0.02 NL_STRIDE=3",
+                " CUDA_LIBRARY="
+                + arguments.library
+                + " NLIST NL_CUTOFF=0.02 NL_STRIDE=3",
                 "7,8,9",
             ),
             (
@@ -242,9 +308,10 @@ def main():
             directory, code = run(name, lines, box=box)
             assert code != 0, directory
             if name == "empty-nlist":
-                assert "no CENTER inside the candidate list" in (
-                    directory / "stdout.log"
-                ).read_text()
+                assert (
+                    "no CENTER inside the candidate list"
+                    in (directory / "stdout.log").read_text()
+                )
             results["negative"].append(dict(case=name, returncode=code))
     results["status"] = "PASSED"
     (work / "RESULTS.json").write_text(json.dumps(results, indent=2) + "\n")
