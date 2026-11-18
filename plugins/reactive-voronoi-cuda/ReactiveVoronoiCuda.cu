@@ -141,11 +141,14 @@ __global__ void forwardKernel(State state) {
     const int center=useNeighbors ? state.candidateCenters[entry] : entry;
     double displacement[3];
     const double length=distance(state,center,assigned,displacement);
-    const double score=-state.kappa*length;
-    if(!isfinite(length) || length<=2.220446049250313e-16 || !isfinite(score)) {
+    if(!isfinite(length) || length<=2.220446049250313e-16) {
       atomicExch(state.invalid,1);
     }
     if(!useNeighbors || length<=state.cutoff) {
+      const double score=-state.kappa*length;
+      if(!isfinite(score)) {
+        atomicExch(state.invalid,1);
+      }
       maximum=fmax(maximum,score);
     }
   }
@@ -209,10 +212,10 @@ __global__ void backwardKernel(State state) {
     const int center=useNeighbors ? state.candidateCenters[entry] : entry;
     double displacement[3];
     const double length=distance(state,center,assigned,displacement);
-    const double weight=exp(-state.kappa*length-maximum)/normalization;
     if(useNeighbors && length>state.cutoff) {
       continue;
     }
+    const double weight=exp(-state.kappa*length-maximum)/normalization;
     const double radial=-state.kappa*weight*(state.sensitivity[center]-mean)/length;
     for(int axis=0; axis<3; ++axis) {
       const double gradient=radial*displacement[axis];

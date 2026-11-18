@@ -194,6 +194,26 @@ def main():
             dict(geometry="displacement-rebuild", mode=mode, errors=errors)
         )
 
+    # Only the center at distance 0.5 contributes. The buffered center at
+    # distance 2 would overflow the score if evaluated before the true cutoff.
+    for mode, backend in modes.items():
+        directory, code = run(
+            "buffer-only-score-" + mode,
+            [
+                "v: VORONOI_COORDINATION CENTERS=1,2 ASSIGNED=3 SELECT=1 "
+                "REFERENCE=0 KAPPA=1e308 NLIST NL_CUTOFF=1 NL_STRIDE=3 NL_SKIN=1.5"
+                + backend,
+                "PRINT ARG=v FILE=values",
+                "DUMPDERIVATIVES ARG=v FILE=derivatives",
+            ],
+            coordinates=[[0, 0, 0], [2.5, 0, 0], [0.5, 0, 0]],
+        )
+        assert code == 0, directory
+        assert read_numbers(directory / "values")[0][1] == 1.0, directory
+        derivatives = read_numbers(directory / "derivatives")
+        assert derivatives and all(row[-1] == 0.0 for row in derivatives), directory
+        results["positive"].append(dict(geometry="buffer-only-score", mode=mode))
+
     invalid = [
         (
             "nlist-missing-stride",
