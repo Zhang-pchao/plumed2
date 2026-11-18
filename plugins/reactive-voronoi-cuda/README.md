@@ -1,75 +1,137 @@
-# Experimental reactive Voronoi acceleration
+# Reactive Voronoi assignment backends
 
-The three scalar actions retain their existing mathematical definitions.
-CPU evaluation automatically shares compatible geometry, softmax weights and
-occupancies within one PLUMED instance. NO_SHARE selects the independent
-reference path. No process-global cache is used.
+VORONOI_COORDINATION, VORONOI_DISTANCE and VORONOI_POSITION accept explicit
+atom selections and preserve their mathematical definitions across the
+assignment backends. The optional CUDA library implements FP64 soft
+assignments and their analytic reverse derivatives.
 
-Compatibility requires identical ordered CENTERS/ASSIGNED, PBC and SERIAL
-settings, neighbor cutoff/skin/stride and neighbor algorithm. Different KAPPA
-values share CPU geometry but keep separate normalized weights. REFERENCE and
-all scalar reduction parameters remain consumer-local. Compatible strided
-neighbor lists share candidate-list ownership and displacement references.
-Exact coordinates, box and step are checked on every evaluation request.
-Coordinate changes at a repeated MD step invalidate the cache.
+## Input and backend selection
 
-Each action still computes its own analytic derivatives. PLUMED combines bias
-sensitivities through its usual force graph. Direct distance/position terms and
-box derivatives are not replaced. Sharing the forward pass is not equivalent
-to fusing all reverse passes.
-
-## Optional CUDA backend
-
-Build on a Linux CUDA host, selecting the architecture of the intended GPU:
-
-~~~bash
-nvcc -O3 -std=c++17 -arch=sm_70 -Xcompiler=-fPIC -shared \
-  ReactiveVoronoiCuda.cu -o libReactiveVoronoiCuda.so
-~~~
-
-CPU-only Linux installations do not require CUDA headers or the optional library.
-GPU selection is explicit on each compatible action:
+The default is shared CPU evaluation. Compatible actions in one PLUMED
+instance reuse geometry, normalized weights and occupancies. Different
+KAPPA values share CPU geometry and normalize separately. Each action keeps
+its own REFERENCE, SELECT, coefficients, sign and reduction semantics.
 
 ~~~plumed
-UNITS LENGTH=A
-q: VORONOI_COORDINATION CENTERS=1,2 ASSIGNED=3,4 KAPPA=5 REFERENCE=1 POWER=2 BACKEND=CUDA CUDA_LIBRARY=./libReactiveVoronoiCuda.so
-d: VORONOI_DISTANCE CENTERS=1,2 ASSIGNED=3,4 KAPPA=5 REFERENCE=1 GROUP1=1 GROUP2=2 BACKEND=CUDA CUDA_LIBRARY=./libReactiveVoronoiCuda.so
+q: VORONOI_COORDINATION CENTERS=1,2 ASSIGNED=3,4 KAPPA=5 REFERENCE=1 POWER=2
+d: VORONOI_DISTANCE CENTERS=1,2 ASSIGNED=3,4 KAPPA=5 REFERENCE=1 GROUP1=1,2
 PRINT ARG=q,d FILE=COLVAR
 ~~~
 
-The prototype supports complete exponential assignments, a single MPI rank,
-orthorhombic PBC and NOPBC. It rejects NLIST, triclinic PBC and multi-rank CUDA
-requests explicitly; these inputs remain supported by the CPU backend.
-The regional compact-kernel action is a separate implementation, not
-implicitly converted to the exponential kernel.
+Add NO_SHARE to select independent CPU evaluation for a reference comparison.
+BACKEND=CPU also selects shared CPU evaluation.
 
-FP64 forward and reverse kernels stream over centers for each assigned atom.
-They retain O(Ncenters+Nassigned) device data rather than a dense weight matrix.
-One context is reused per compatible KAPPA. Coordinate, occupancy, sensitivity,
-force and virial transfers use an owned CUDA stream. OPES, scalar reductions
-and direct terms remain on the CPU. The plugin uses the currently selected
-CUDA device and respects the host CUDA_VISIBLE_DEVICES mapping.
+BACKEND=CUDA explicitly requests CUDA and reports an error when the library,
+device or requested calculation is unsupported.
 
-The current LAMMPS-PLUMED host interface still supplies host coordinates.
-This implementation does not claim device-resident MD integration or overlap
-with DeePMD execution. GPU kernel throughput and complete MD throughput must
-be measured separately. Small systems may be slower on CUDA.
+~~~plumed
+q: VORONOI_COORDINATION CENTERS=1,2 ASSIGNED=3,4 KAPPA=5 REFERENCE=1 POWER=2 BACKEND=CUDA CUDA_LIBRARY=/path/libReactiveVoronoiCuda.so
+~~~
+
+BACKEND=AUTO opts into capability detection. It selects CUDA when the library,
+device and input are supported. Otherwise it selects CPU and logs the reason.
+
+~~~plumed
+q: VORONOI_COORDINATION CENTERS=1,2 ASSIGNED=3,4 KAPPA=5 REFERENCE=1 POWER=2 BACKEND=AUTO
+~~~
+
+CUDA_LIBRARY defaults to libReactiveVoronoiCuda.so, searched through the
+system dynamic-library search path. An explicit path is useful for isolated
+installations. Backend names are case insensitive. The log identifies the
+requested backend, selected backend and GPU device when available.
+
+AUTO checks capability and input compatibility. Actual speed depends on system
+size, reduction groups, host transfers and the MD workload. The CPU default
+keeps existing inputs reproducible, and small groups can favor CPU execution.
+An initialization fallback persists for the action's lifetime. Changes between
+orthorhombic and triclinic boxes select a compatible backend on each request.
+Calculation errors after successful CUDA initialization propagate normally.
+
+The currently supported CUDA domain is complete exponential assignments,
+one MPI rank, axis-aligned orthorhombic PBC, and NOPBC. AUTO uses CPU for
+NLIST, triclinic PBC and multiple MPI ranks. CPU retains these capabilities.
+The regional compact-kernel action has its own implementation.
+
+## Building the optional library
+
+The PLUMED core builds with a normal C++ compiler and keeps CUDA headers
+confined to the plugin. Build the CUDA library on a Linux CUDA host.
+
+~~~bash
+make CUDA_ARCH=sm_70
+~~~
+
+Select the architecture of the target GPU, such as sm_70 for V100 or sm_80
+for A100. The default CUDA_ARCH=native detects the GPU on the compilation
+host. Set NVCC and NVCCFLAGS when the toolchain requires them. Install the
+resulting libReactiveVoronoiCuda.so in a versioned library directory and put
+that directory in LD_LIBRARY_PATH, or provide CUDA_LIBRARY in the input.
+
+The build links the shared CUDA runtime and marks the Linux library NODELETE.
+This follows the lifetime protection used by the official CUDA plugin and
+preserves an MD engine's live device allocations when PLUMED is destroyed.
+
+## Device ownership and data flow
+
+Device selection follows the MD-provided setGpuDeviceId when supplied.
+Otherwise it captures the current CUDA device on first evaluation. Every
+allocation, transfer, kernel, synchronization and release uses that captured
+device, and restores the caller's device afterward. CUDA_VISIBLE_DEVICES
+provides the usual logical-device mapping.
+
+The v2 context factory accepts the MD device. The v1 factory remains exported.
+The core accepts a v1 library when the MD device is unspecified. An explicit
+MD device requires a library providing the v2 factory.
+
+Each compatible KAPPA context retains O(Ncenters+Nassigned) device buffers.
+FP64 kernels stream over centers for each assigned atom, with shifted-softmax
+normalization. Each scalar action still contracts its own analytic derivatives.
+PLUMED combines bias sensitivities using its existing force graph.
+
+OPES, scalar reductions, direct distance/position terms and their direct
+virial contributions execute on CPU. Full-pool VORONOI_DISTANCE therefore
+includes a CPU center-pair reduction. The current host MD interface supplies
+host coordinates and receives host forces.
+
+The official cudaCoord plugin registers CUDACOORDINATION and
+CUDACOORDINATIONFLOAT after LOAD. The openaccPTM plugin adds USEGPU selection
+to its supported actions after LOAD. This experimental library is loaded by
+the Voronoi core through CUDA_LIBRARY. Its BACKEND input is specific to these
+three actions. The upstream integration route is documented in UPSTREAM.md.
 
 ## Validation
 
-The rt-reactive-voronoi-shared test checks simultaneous biases, mixed KAPPA,
-reordered selections, repeated-step coordinate and box changes, independent
-PLUMED instances, strided-list behavior and finite-difference forces. Its
-executable optionally takes a CUDA keyword suffix to compare GPU evaluation
-against the independent CPU path.
+The core regtests rt-reactive-voronoi-shared and
+rt-reactive-voronoi-backends run with CPU-only PLUMED. The latter covers
+coordination powers/signs/selections, cross/within-group distances, position
+axes/signs/normalization/absolute values, reordered atoms, mixed KAPPA,
+PBC/NOPBC, strided lists, repeated-step changes and finite-difference forces
+and cell derivatives. It includes a triclinic position-image regression.
 
-Use native driver trajectories to compare CVs and every coordinate/box
-derivative, then compare fixed-configuration total bias forces. Long chaotic
-trajectories are not a pointwise equivalence criterion. Match hardware,
-timestep, output and OPES physical update intervals in MD benchmarks.
-Keep a nonempty, matching OPES STATE with each MD checkpoint.
+Run the driver matrix from the plugin directory with the selected PLUMED
+installation. Run the CUDA cases on a CUDA-capable device.
 
-A host MD engine must accept the actual PLUMED command API of the build.
-For an older host with a strict upper API guard, backport these CV changes to
-a qualified PLUMED base and repeat interface/driver/force tests. Do not spoof
-the command API or change a shared installation to bypass that guard.
+~~~bash
+make CUDA_ARCH=sm_70 check PLUMED=/absolute/path/bin/plumed
+~~~
+
+In a configured PLUMED source build, the native CPU regression is available
+through PLUMED's test harness.
+
+~~~bash
+make -C regtest/basic/rt-reactive-voronoi-backends
+~~~
+
+The native test executable also accepts a backend suffix for a manual CUDA
+or AUTO run. Use an empty working directory for each run because the test
+writes logs and an output file in the current directory.
+
+~~~bash
+/absolute/path/to/regtest/basic/rt-reactive-voronoi-backends/tmp/exe " BACKEND=CUDA CUDA_LIBRARY=/absolute/path/libReactiveVoronoiCuda.so"
+~~~
+
+Strict CUDA tests compare every supported force/virial component to CPU and
+finite-difference diagonal strains for PBC. AUTO also checks sheared boxes
+through its CPU fallback. All cell strains are checked for NOPBC.
+
+Application benchmarks and large trajectories belong in separate case records.

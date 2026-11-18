@@ -1,50 +1,122 @@
-// Optional, explicitly selected CUDA plugin. CPU builds require no CUDA headers.
-#ifndef PLUMED_REACTIVE_VORONOI_CUDA_H
-#define PLUMED_REACTIVE_VORONOI_CUDA_H
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2026 Reactive Voronoi contributors
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#ifndef __PLUMED_colvar_ReactiveVoronoiCuda_h
+#define __PLUMED_colvar_ReactiveVoronoiCuda_h
+
+#include "tools/DLLoader.h"
+#ifdef __PLUMED_HAS_DLOPEN
 #include <dlfcn.h>
+#endif
 #include <stdexcept>
 #include <string>
 
 namespace PLMD {
 namespace colvar {
+
+/// Optional runtime backend. CUDA headers are confined to the plugin.
 class ReactiveVoronoiCuda {
+  DLLoader loader_;
   void* library_=nullptr;
   void* state_=nullptr;
+  int device_=-1;
   using Create=void*(*)(int,int);
+  using CreateOnDevice=void*(*)(int,int,int);
   using Destroy=void(*)(void*);
   using Forward=int(*)(void*,const double*,const double*,int,double,double*);
   using Backward=int(*)(void*,const double*,double*,double*);
+  using Device=int(*)(void*);
+  using DeviceCount=int(*)();
   Destroy destroy_=nullptr;
   Forward forward_=nullptr;
   Backward backward_=nullptr;
-  template<class T> T symbol(const char* name) {
+
+  template<class Function>
+  Function symbol(const char* name, bool required=true) {
+#ifdef __PLUMED_HAS_DLOPEN
     void* value=dlsym(library_,name);
-    if(!value) throw std::runtime_error(std::string("Missing CUDA backend symbol: ")+name);
-    return reinterpret_cast<T>(value);
+    if(!value && required) {
+      throw std::runtime_error(std::string("Missing CUDA backend symbol ")+name);
+    }
+    return reinterpret_cast<Function>(value);
+#else
+    (void)name;
+    (void)required;
+    throw std::runtime_error("Dynamic loading is unavailable in this PLUMED build");
+#endif
   }
+
 public:
-  ReactiveVoronoiCuda(const std::string& path,int centers,int assigned) {
-    library_=dlopen(path.c_str(),RTLD_NOW|RTLD_LOCAL);
-    if(!library_) throw std::runtime_error(std::string("Cannot load CUDA backend: ")+dlerror());
-    try {
-      auto create=symbol<Create>("reactive_voronoi_create_v1");
-      destroy_=symbol<Destroy>("reactive_voronoi_destroy_v1");
-      forward_=symbol<Forward>("reactive_voronoi_forward_v1");
-      backward_=symbol<Backward>("reactive_voronoi_backward_v1");
-      state_=create(centers,assigned);
-      if(!state_) throw std::runtime_error("CUDA backend allocation failed");
-    } catch(...) { dlclose(library_); library_=nullptr; throw; }
+  ReactiveVoronoiCuda(const std::string& path, int centers, int assigned,
+                      int mdDevice=-1) {
+    if(!DLLoader::installed()) {
+      throw std::runtime_error("Dynamic loading is unavailable in this PLUMED build");
+    }
+    library_=loader_.load(path);
+    const auto create=symbol<Create>("reactive_voronoi_create_v1");
+    const auto createOnDevice=symbol<CreateOnDevice>("reactive_voronoi_create_v2",false);
+    const auto deviceCount=symbol<DeviceCount>("reactive_voronoi_device_count_v1",false);
+    const auto device=symbol<Device>("reactive_voronoi_device_v1",false);
+    destroy_=symbol<Destroy>("reactive_voronoi_destroy_v1");
+    forward_=symbol<Forward>("reactive_voronoi_forward_v1");
+    backward_=symbol<Backward>("reactive_voronoi_backward_v1");
+    if(deviceCount && deviceCount()==0) {
+      throw std::runtime_error("No CUDA device is available");
+    }
+    if(mdDevice>=0 && !createOnDevice) {
+      throw std::runtime_error("This CUDA library needs the v2 factory to honor setGpuDeviceId");
+    }
+    state_=createOnDevice ? createOnDevice(centers,assigned,mdDevice) :
+           create(centers,assigned);
+    if(!state_) {
+      throw std::runtime_error("CUDA backend context creation failed on the requested or current device");
+    }
+    if(device) {
+      device_=device(state_);
+    }
   }
-  ~ReactiveVoronoiCuda() { if(state_) destroy_(state_); if(library_) dlclose(library_); }
+
+  ~ReactiveVoronoiCuda() {
+    if(state_) {
+      destroy_(state_);
+    }
+  }
   ReactiveVoronoiCuda(const ReactiveVoronoiCuda&)=delete;
   ReactiveVoronoiCuda& operator=(const ReactiveVoronoiCuda&)=delete;
-  void forward(const double* x,const double* box,bool pbc,double kappa,double* occupancy) {
-    if(forward_(state_,x,box,pbc,kappa,occupancy)!=0)
-      throw std::runtime_error("CUDA reactive Voronoi forward failed (invalid geometry or CUDA error)");
+
+  int device() const {
+    return device_;
   }
-  void backward(const double* sensitivity,double* derivatives,double* virial) {
-    if(backward_(state_,sensitivity,derivatives,virial)!=0)
+
+  void forward(const double* positions, const double* box, bool pbc,
+               double kappa, double* occupancy) {
+    if(forward_(state_,positions,box,pbc,kappa,occupancy)!=0) {
+      throw std::runtime_error("CUDA reactive Voronoi forward failed; check geometry and CUDA diagnostics");
+    }
+  }
+
+  void backward(const double* sensitivity, double* derivatives, double* virial) {
+    if(backward_(state_,sensitivity,derivatives,virial)!=0) {
       throw std::runtime_error("CUDA reactive Voronoi backward failed");
+    }
   }
 };
 }

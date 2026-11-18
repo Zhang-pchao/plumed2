@@ -202,6 +202,10 @@ protected:
   Assignment independent_;
   std::shared_ptr<ReactiveVoronoiCuda> independentCuda_;
   std::string backend_="CPU", cudaLibrary_;
+  std::string autoCudaFailure_;
+  std::string lastBackendMessage_;
+  void logBackend(const std::string&, const std::string&);
+  std::shared_ptr<ReactiveVoronoiCuda> cudaContext();
   bool sharedCoordinatesMatch() const;
   Assignment computeAssignment();
 
@@ -254,8 +258,8 @@ void SoftVoronoiBase::registerCommonKeywords(Keywords& keys) {
   keys.add("compulsory","KAPPA","Positive soft-assignment sharpness in inverse PLUMED length units");
   keys.add("compulsory","REFERENCE",
            "One intended occupancy broadcast to all CENTERS, or one value per CENTER in CENTERS order");
-  keys.add("compulsory","BACKEND","CPU","Assignment backend: CPU or experimental CUDA");
-  keys.add("optional","CUDA_LIBRARY","Explicit path of the optional FP64 CUDA backend shared library");
+  keys.add("compulsory","BACKEND","CPU","Assignment backend: CPU, CUDA, or opt-in AUTO detection");
+  keys.add("optional","CUDA_LIBRARY","Optional FP64 CUDA library path; defaults to libReactiveVoronoiCuda plus the shared-library extension");
   keys.addFlag("NO_SHARE",false,"Disable instance-local reuse of compatible assignment calculations");
   keys.addFlag("SERIAL",false,"Perform the calculation redundantly on each rank for debugging");
   keys.addFlag("NLIST",false,"Use an approximate neighbor-list truncation of the assignment candidates");
@@ -455,9 +459,19 @@ SoftVoronoiBase::SoftVoronoiBase(const ActionOptions& ao):
 
   parse("BACKEND",backend_);
   parse("CUDA_LIBRARY",cudaLibrary_);
-  if(backend_!="CPU" && backend_!="CUDA") error("BACKEND must be CPU or CUDA");
-  if(backend_=="CUDA" && (cudaLibrary_.empty() || comm.Get_size()!=1))
-    error("CUDA prototype requires CUDA_LIBRARY and a single MPI rank");
+  std::transform(backend_.begin(),backend_.end(),backend_.begin(),
+  [](const char value) {
+    return static_cast<char>(std::toupper(static_cast<unsigned char>(value)));
+  });
+  if(backend_!="CPU" && backend_!="CUDA" && backend_!="AUTO") {
+    error("BACKEND must be CPU, CUDA or AUTO");
+  }
+  if(backend_!="CPU" && cudaLibrary_.empty()) {
+    cudaLibrary_="libReactiveVoronoiCuda.so";
+  }
+  if(backend_=="CUDA" && comm.Get_size()!=1) {
+    error("CUDA prototype requires a single MPI rank");
+  }
   parseFlag("NO_SHARE",noShare_);
   parseFlag("SERIAL",serial_);
   bool noPbc=false;
@@ -469,7 +483,9 @@ SoftVoronoiBase::SoftVoronoiBase(const ActionOptions& ao):
   double neighborSkin=0.0;
   int neighborStride=0;
   parseFlag("NLIST",useNeighborList);
-  if(useNeighborList && backend_=="CUDA") error("CUDA prototype currently requires complete pairs (no NLIST)");
+  if(useNeighborList && backend_=="CUDA") {
+    error("CUDA prototype currently requires complete pairs (no NLIST)");
+  }
   if(useNeighborList) {
     parse("NL_CUTOFF",neighborCutoff);
     parse("NL_STRIDE",neighborStride);
@@ -642,11 +658,15 @@ void SoftVoronoiBase::saveNeighborListReference() {
   }
   if(shared_) {
     shared_->neighborReferencePositions=getPositions();
-    if(pbc_) shared_->neighborReferenceBox=getPbc().getBox();
+    if(pbc_) {
+      shared_->neighborReferenceBox=getPbc().getBox();
+    }
     shared_->haveNeighborReference=true;
   } else {
     neighborReferencePositions_=getPositions();
-    if(pbc_) neighborReferenceBox_=getPbc().getBox();
+    if(pbc_) {
+      neighborReferenceBox_=getPbc().getBox();
+    }
     haveNeighborReference_=true;
   }
 }
@@ -707,25 +727,90 @@ const SoftVoronoiBase::Assignment& SoftVoronoiBase::calculateAssignment() {
   return inserted.first->second;
 }
 
-SoftVoronoiBase::Assignment SoftVoronoiBase::computeAssignment() {
-  if(backend_=="CUDA") {
-    const Tensor box=getPbc().getBox();
-    double diagonal[3];
-    for(unsigned i=0;i<3;++i) {
-      diagonal[i]=box(i,i);
-      if(pbc_ && (!std::isfinite(diagonal[i]) || diagonal[i]<=0))
-        error("CUDA requires a finite positive orthorhombic box");
-      for(unsigned j=0;j<3;++j)
-        if(pbc_ && i!=j && box(i,j)!=0) error("CUDA prototype supports orthorhombic PBC or NOPBC");
+void SoftVoronoiBase::logBackend(const std::string& selected,
+                                 const std::string& reason) {
+  const std::string message=selected+" ("+reason+")";
+  if(message!=lastBackendMessage_) {
+    log.printf("  reactive Voronoi %s requested %s; selected %s\n",
+               getLabel().c_str(),backend_.c_str(),message.c_str());
+    lastBackendMessage_=message;
+  }
+}
+
+std::shared_ptr<ReactiveVoronoiCuda> SoftVoronoiBase::cudaContext() {
+  if(backend_=="CPU") {
+    logBackend("CPU","shared evaluation enabled unless NO_SHARE is set");
+    return nullptr;
+  }
+  std::string unsupported;
+  if(comm.Get_size()!=1) {
+    unsupported="multiple MPI ranks";
+  } else if(neighborCutoff_>0) {
+    unsupported="NLIST requires the CPU backend";
+  } else if(pbc_) {
+    const Tensor& box=getPbc().getBox();
+    for(unsigned i=0; i<3; ++i) {
+      if(!std::isfinite(box(i,i)) || box(i,i)<=0) {
+        unsupported="PBC requires a finite positive orthorhombic box";
+      }
+      for(unsigned j=0; j<3; ++j) {
+        if(i!=j && box(i,j)!=0) {
+          unsupported="triclinic PBC requires the CPU backend";
+        }
+      }
     }
-    auto& context=shared_ ? shared_->cuda[kappa_] : independentCuda_;
-    if(!context) context=std::make_shared<ReactiveVoronoiCuda>(cudaLibrary_,centers_.size(),assigned_.size());
+  }
+  if(!unsupported.empty()) {
+    if(backend_=="CUDA") {
+      error("CUDA backend does not support "+unsupported);
+    }
+    logBackend("CPU",unsupported);
+    return nullptr;
+  }
+  if(!autoCudaFailure_.empty()) {
+    logBackend("CPU",autoCudaFailure_);
+    return nullptr;
+  }
+  auto& context=shared_ ? shared_->cuda[kappa_] : independentCuda_;
+  if(!context) {
+    try {
+      context=std::make_shared<ReactiveVoronoiCuda>(
+                cudaLibrary_,centers_.size(),assigned_.size(),plumed.getGpuDeviceId());
+    } catch(const std::exception& failure) {
+      if(backend_=="CUDA") {
+        error(std::string("CUDA initialization failed: ")+failure.what());
+      }
+      autoCudaFailure_=std::string("AUTO initialization fallback: ")+failure.what();
+      logBackend("CPU",autoCudaFailure_);
+      return nullptr;
+    }
+  }
+  const std::string device=context->device()>=0 ?
+                           "device "+std::to_string(context->device()) :
+                           "current device (legacy backend library)";
+  logBackend("CUDA",device+"; assignment and assignment derivatives");
+  return context;
+}
+
+SoftVoronoiBase::Assignment SoftVoronoiBase::computeAssignment() {
+  const auto context=cudaContext();
+  if(context) {
+    const Tensor& box=getPbc().getBox();
+    double diagonal[3];
+    for(unsigned axis=0; axis<3; ++axis) {
+      diagonal[axis]=box(axis,axis);
+    }
     Assignment result;
     result.cuda=context;
     result.occupancy.resize(centers_.size());
     std::vector<double> positions(3*getPositions().size());
-    for(unsigned i=0;i<getPositions().size();++i)
-      for(unsigned k=0;k<3;++k) positions[3*i+k]=getPosition(i)[k];
+    for(unsigned atom=0; atom<getPositions().size(); ++atom) {
+      for(unsigned axis=0; axis<3; ++axis) {
+        positions[3*atom+axis]=getPosition(atom)[axis];
+      }
+    }
+    // Calculation failures propagate for both CUDA and AUTO. Invalid geometry
+    // must remain an error after a backend has been successfully initialized.
     context->forward(positions.data(),diagonal,pbc_,kappa_,result.occupancy.data());
     return result;
   }
@@ -1098,10 +1183,14 @@ void SoftVoronoiBase::addAssignmentDerivatives(
     std::vector<double> gradient(3*derivatives.size());
     double boxGradient[9];
     assignment.cuda->backward(derivativeByDefect.data(),gradient.data(),boxGradient);
-    for(unsigned i=0;i<derivatives.size();++i)
-      for(unsigned k=0;k<3;++k) derivatives[i][k]+=gradient[3*i+k];
-    for(unsigned i=0;i<3;++i)
-      for(unsigned j=0;j<3;++j) virial(i,j)+=boxGradient[3*i+j];
+    for(unsigned i=0; i<derivatives.size(); ++i)
+      for(unsigned k=0; k<3; ++k) {
+        derivatives[i][k]+=gradient[3*i+k];
+      }
+    for(unsigned i=0; i<3; ++i)
+      for(unsigned j=0; j<3; ++j) {
+        virial(i,j)+=boxGradient[3*i+j];
+      }
     return;
   }
   unsigned numberOfThreads=1;
@@ -1408,6 +1497,24 @@ changes can introduce small discontinuities because the retained weights are
 renormalized.  Prefer exact mode for derivative validation and for small or
 moderate systems.  Use NLIST only after a value-and-force convergence scan
 demonstrates a useful speed/accuracy tradeoff for the target system.
+
+## Shared and CUDA assignment backends
+
+BACKEND=CPU is the default. Compatible actions in one PLUMED instance share
+geometry and, for equal KAPPA, weights and occupancies. NO_SHARE selects an
+independent CPU reference. Consumer-specific selections and reductions retain
+their own meanings.
+
+BACKEND=CUDA explicitly requests the optional FP64 CUDA library.
+BACKEND=AUTO selects a compatible available backend and logs the choice.
+CUDA_LIBRARY supplies its path; the default library name on Linux is
+libReactiveVoronoiCuda.so. The CUDA implementation currently supports complete
+exponential assignments, one MPI rank, orthorhombic PBC and NOPBC. AUTO uses
+CPU for NLIST, triclinic boxes or multiple MPI ranks. OPES, scalar reductions
+and direct distance/position terms execute on CPU.
+
+The plugin README describes compilation, device selection and examples.
+Choose a backend using matched numerical checks and workload timings.
 
 ## CPU parallelism and practical scaling
 
@@ -2219,7 +2326,7 @@ VoronoiPosition::VoronoiPosition(const ActionOptions& ao):
 void VoronoiPosition::calculate() {
   const Assignment& assignment=calculateAssignment();
   const std::vector<double> defect=defects(assignment);
-  std::vector<double> displacement(selected_.size(),0.0);
+  std::vector<Vector> imagePositions(selected_.size());
   std::vector<double> function(selected_.size(),0.0);
   std::vector<double> weight(selected_.size(),0.0);
   std::vector<double> weightDerivative(selected_.size(),0.0);
@@ -2234,15 +2341,16 @@ void VoronoiPosition::calculate() {
     const Vector relative=pbc_ ?
                           pbcDistance(reference,getPosition(i)) :
                           delta(reference,getPosition(i));
-    displacement[s]=relative[axis_];
-    if(!std::isfinite(displacement[s])) {
+    const double displacement=relative[axis_];
+    imagePositions[s]=pbc_ ? reference+relative : getPosition(i);
+    if(!std::isfinite(displacement)) {
       error("VORONOI_POSITION displacement is non-finite");
     }
     function[s]=absolute_ ?
-                std::fabs(displacement[s]) : displacement[s];
+                std::fabs(displacement) : displacement;
     functionDerivative[s]=absolute_ ?
-                          (displacement[s]>0.0 ? 1.0 :
-                           (displacement[s]<0.0 ? -1.0 : 0.0)) : 1.0;
+                          (displacement>0.0 ? 1.0 :
+                           (displacement<0.0 ? -1.0 : 0.0)) : 1.0;
 
     const bool included=
       sign_=="ALL" ||
@@ -2282,11 +2390,8 @@ void VoronoiPosition::calculate() {
       Vector directDerivative;
       directDerivative[axis_]=directScalar;
       derivatives[i]+=directDerivative;
-      Vector imagePosition=getPosition(i);
-      if(pbc_) {
-        imagePosition[axis_]=origin_+displacement[s];
-      }
-      virial-=Tensor(imagePosition,directDerivative);
+      // A triclinic lattice translation can change every Cartesian component.
+      virial-=Tensor(imagePositions[s],directDerivative);
     }
   }
 
