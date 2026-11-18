@@ -54,14 +54,21 @@ support complete assignments, and AUTO uses CPU if their NLIST symbol is
 missing.
 
 NLIST uses the same CPU-built candidate list and cutoff in both backends.
-CUDA uploads the candidate list after each rebuild and reuses the uploaded
-indices between evaluations. With a skin, CUDA filters the candidates
-against the exact cutoff at every evaluation. The center-distance reduction
-for VORONOI_DISTANCE remains on the host. NLIST renormalizes over the
-retained centers, so check both CVs and forces against complete assignments
-when choosing NL_CUTOFF. NL_STRIDE=1 rebuilds the candidates each step.
-For longer strides use a positive NL_SKIN to enable displacement-triggered
-rebuilds.
+Each CUDA context uploads the list after a rebuild and reuses the uploaded
+indices between evaluations. The center-distance reduction for
+VORONOI_DISTANCE runs on the host over the configured GROUP1 and GROUP2
+pairs. NLIST renormalizes the assignment over the retained centers, so check
+both CVs and forces against complete assignments when choosing NL_CUTOFF.
+NL_STRIDE=1 rebuilds the candidates each step. For longer strides use a
+positive NL_SKIN to enable displacement- and box-triggered rebuilds.
+
+~~~plumed
+UNITS LENGTH=A
+q: VORONOI_COORDINATION CENTERS=1,2 ASSIGNED=3,4 KAPPA=5 REFERENCE=1 POWER=2 NLIST NL_CUTOFF=6 NL_SKIN=0.5 NL_STRIDE=10 BACKEND=AUTO
+~~~
+
+The distances in this example are in angstroms. Choose the cutoff and buffer
+for the actual atom selections and length units.
 
 ## Building the optional library
 
@@ -94,10 +101,12 @@ The v2 context factory accepts the MD device. The v1 factory remains exported.
 The core accepts a v1 library when the MD device is unspecified. An explicit
 MD device requires a library providing the v2 factory.
 
-Each compatible KAPPA context retains O(Ncenters+Nassigned) device buffers.
-FP64 kernels stream over centers for each assigned atom, with shifted-softmax
-normalization. Each scalar action still contracts its own analytic derivatives.
-PLUMED combines bias sensitivities using its existing force graph.
+Each compatible KAPPA context retains O(Ncenters+Nassigned) device buffers
+for complete assignments. NLIST adds offsets by assigned atom and one center
+index per buffered candidate. FP64 kernels stream over the selected centers
+for each assigned atom and use shifted-softmax normalization. Each scalar
+action still contracts its own analytic derivatives. PLUMED combines bias
+sensitivities using its existing force graph.
 
 OPES, scalar reductions, direct distance/position terms and their direct
 virial contributions execute on CPU. Full-pool VORONOI_DISTANCE therefore

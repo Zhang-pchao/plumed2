@@ -49,9 +49,10 @@ review ownership and maintenance responsibility for new modules.
 
 ## Review boundaries
 
-The FP64 CUDA prototype supports one MPI rank, complete exponential
-assignments and axis-aligned orthorhombic PBC or NOPBC. AUTO uses CPU for the
-other currently supported CPU modes. Scalar/direct reductions and OPES
+The FP64 CUDA prototype supports one MPI rank and axis-aligned orthorhombic
+PBC or NOPBC, with complete exponential assignments or buffered NLIST.
+AUTO uses CPU for unsupported CUDA layouts and for NLIST when the loaded
+plugin predates neighbor-list support. Scalar/direct reductions and OPES
 execute on CPU.
 
 Official GPU CI, the final public API, plugin registration and broader GPU
