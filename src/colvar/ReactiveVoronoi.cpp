@@ -1375,23 +1375,23 @@ same assignment is shared by [VORONOI_DISTANCE](VORONOI_DISTANCE.md) and
 the amount, separation, and location of coordination defects without
 hard-coding water, glycine, a catalyst, or an atom-list position.
 
-The construction follows the descriptors introduced for acid-base equilibria
-and condensed-phase tautomerism in the first two papers cited below.
-Applications to solvated glycine (third paper cited below), interfacial
-water ions, electric-field effects, and electrocatalytic nitrogen reduction
-are discussed in Zhang et al. (2024, 2025, 2026).
+The soft-assignment construction follows
+[Grifoni et al. (2019)](https://doi.org/10.1073/pnas.1819771116) for acid-base
+equilibria and
+[Grifoni et al. (2020)](https://doi.org/10.1021/acs.jctc.0c00519) for
+condensed-phase tautomerism.
+[Zhang et al. (2024)](https://doi.org/10.1021/acs.jcim.4c00273) applied a
+signed coordination defect to protonation in solvated glycine.
 
 An illustrated bilingual guide with downloadable teaching structures,
 application examples, performance data, and additional references is
 available on the
 [Reactive Soft-Voronoi CV project page](https://zhang-pchao.github.io/code/reactive-voronoi/).
 
-VORONOI_COORDINATION, [VORONOI_DISTANCE](VORONOI_DISTANCE.md), and
-[VORONOI_POSITION](VORONOI_POSITION.md) are part of PLUMED's default `colvar`
-module and have no external library dependency.  In a PLUMED installation that
-contains these Actions, use them directly in the input; no [LOAD](LOAD.md)
-line or optional module is required.  Bias examples using
-[OPES_METAD](OPES_METAD.md) additionally require the `opes` module.
+All three Actions are in the default `colvar` module and can run on the
+CPU with no additional library.  For CUDA, follow the
+[backend setup](#shared-and-cuda-assignment-backends).  Bias examples using
+[OPES_METAD](OPES_METAD.md) require the `opes` module.
 
 ## Soft assignment and coordination defects
 
@@ -1407,9 +1407,9 @@ By default, $d_{ij}$ is evaluated with the minimum-image convention.
 NOPBC instead uses the direct coordinate difference, so the input coordinates
 must already follow a consistent unwrapped image convention.
 
-The denominator contains all CENTERS for the same assigned atom, so
-$\sum_i w_{ij}=1$.  KAPPA is positive and has inverse units of the current
-PLUMED length unit.  Increasing KAPPA sharpens the assignment toward the
+In the full-pair calculation, the denominator contains all CENTERS for the
+same assigned atom, so $\sum_i w_{ij}=1$.  KAPPA is positive and has inverse
+units of the length set by [UNITS](UNITS.md).  Increasing KAPPA sharpens the assignment toward the
 nearest center; reducing it spreads an assigned atom over more centers.  The
 implementation uses a shifted softmax, which improves numerical stability
 without changing the mathematical value.
@@ -1495,8 +1495,8 @@ Build the input from chemistry rather than from atom-list positions:
 
 REFERENCE follows CENTERS order.  COEFFICIENTS follows SELECT order.  If the
 centers are reordered, reorder the corresponding numeric vector as well.
-Atom-valued SELECT, GROUP1, and GROUP2 lists use absolute atom numbers and do
-not rely on a center being last, first, or one of a fixed number of species.
+Atom-valued lists such as SELECT, GROUP1, and GROUP2 use absolute atom
+numbers.  [GROUP](GROUP.md) can name reusable atom lists.
 
 ## Exact and neighbor-list calculations
 
@@ -1522,9 +1522,9 @@ Smaller KAPPA generally requires a larger cutoff.  This estimate does not
 replace convergence because omitted scores, normalization errors, and force
 derivatives can accumulate over many centers.
 
-NL_CUTOFF and NL_STRIDE are required whenever NLIST is present.  NL_SKIN is
-optional, defaults to zero, and can be used only when NL_STRIDE is greater
-than one.
+NL_CUTOFF and NL_STRIDE are required whenever NLIST is present.  NL_STRIDE
+sets the scheduled rebuild interval in steps.  NL_SKIN defaults to zero.
+Use a positive NL_SKIN with NL_STRIDE greater than one.
 
 Before using NLIST in production:
 
@@ -1559,9 +1559,8 @@ demonstrates a useful speed/accuracy tradeoff for the target system.
 ## Shared and CUDA assignment backends
 
 BACKEND=CPU is the default. Compatible actions in one PLUMED instance share
-geometry and, for equal KAPPA, weights and occupancies. NO_SHARE selects an
-independent CPU reference. Consumer-specific selections and reductions retain
-their own meanings.
+geometry and, for equal KAPPA, weights and occupancies.  Use NO_SHARE with
+BACKEND=CPU to obtain an independent CPU reference.
 
 Load the optional CUDA plugin with [LOAD](LOAD.md) before the CV.
 BACKEND=CUDA explicitly requests CUDA. BACKEND=AUTO selects CUDA if the loaded
@@ -1572,8 +1571,9 @@ applies the same cutoff at each evaluation. OPES, scalar reductions and direct
 distance/position terms execute on CPU. Floating-point CUDA reductions may
 differ in the last digits between runs.
 
-The plugin README describes compilation, device selection and examples.
-Choose a backend using matched numerical checks and workload timings.
+The [CUDA plugin README](https://github.com/plumed/plumed2/blob/master/plugins/reactive-voronoi-cuda/README.md)
+describes compilation, device selection, and examples.  Choose a backend using
+matched numerical checks and workload timings.
 
 ## CPU parallelism and practical scaling
 
@@ -1596,10 +1596,10 @@ plumed driver --plumed plumed.dat --ixyz trajectory.xyz --box 3.0,3.0,3.0
 Benchmark 1, 2, 4, and 8 threads on the same frames because small candidate
 lists can spend more time entering parallel regions than doing pair work, and
 large lists can become limited by memory bandwidth.  Avoid CPU
-oversubscription.  In a GPU molecular-dynamics run these Actions still execute
-on CPUs, so a GPU allocation alone does not accelerate them.  MPI also
-partitions pairs unless SERIAL is present; SERIAL is a debugging mode that
-repeats the work on every rank, not a performance option.
+oversubscription.  With BACKEND=CPU, the CV runs on the CPU even if the MD
+force field runs on the GPU.  For CPU evaluation, MPI partitions pairs by
+default.  SERIAL is a debugging flag that repeats the calculation on each
+rank.
 
 For large systems, a converged NLIST is the only option here that reduces the
 number of retained assignment pairs.  NL_CUTOFF controls truncation accuracy,
@@ -1612,9 +1612,10 @@ that GPU force-model time and output time are not mistaken for CV cost.
 ## Worked example 1: water autoionization
 
 For water, oxygen atoms can be used as CENTERS, hydrogen atoms as ASSIGNED,
-and the neutral reference occupancy is two.  In a configuration containing
-one hydronium and one hydroxide, the corresponding defects approach +1 and
--1.
+and the neutral reference occupancy is two.  For a hydronium-hydroxide pair,
+the corresponding defects approach +1 and -1 respectively.
+[Zhang and Xu (2025)](https://doi.org/10.1021/acs.langmuir.4c05004) used this
+defect activity to follow water autoionization and recombination.
 
 ```plumed
 UNITS LENGTH=A
@@ -1641,7 +1642,8 @@ The numeric cutoff, skin, and stride below are only input examples, not
 transferable recommendations.  Use the three stages in order: establish an
 exact reference, converge NL_CUTOFF while rebuilding every step, and only
 then test whether a displacement-safe skin and a longer stride improve
-performance without changing values or forces.
+performance.  Use [DUMPDERIVATIVES](DUMPDERIVATIVES.md) to compare the CV
+derivatives.
 
 ```plumed
 UNITS LENGTH=A
@@ -1677,7 +1679,7 @@ opes: OPES_METAD ARG=ionization PACE=500 BARRIER=40 TEMP=300
 PRINT ARG=ionization,opes.bias FILE=COLVAR STRIDE=10
 ```
 
-Passing a one-frame `plumed driver` test only establishes parsing and local
+Passing a one-frame [driver](driver.md) test checks input parsing and local
 evaluation.  Before production biasing, verify analytical derivatives,
 energy/force units, restart behavior, the unbiased CV distribution, and a
 short molecular-dynamics force-path run.
@@ -1743,6 +1745,7 @@ void VoronoiCoordination::registerKeywords(Keywords& keys) {
   keys.addDOI("10.1073/pnas.1819771116");
   keys.addDOI("10.1021/acs.jctc.0c00519");
   keys.addDOI("10.1021/acs.jcim.4c00273");
+  keys.addDOI("10.1021/acs.langmuir.4c05004");
   registerCommonKeywords(keys);
   keys.add("atoms","SELECT","Subset of CENTERS included in the scalar reduction; the default is all centers");
   keys.add("optional","COEFFICIENTS","One coefficient, or one value per atom in SELECT");
@@ -1818,7 +1821,8 @@ This Action combines the continuously changing identities defined by
 [VORONOI_COORDINATION](VORONOI_COORDINATION.md) with physical center-center
 distances.  It is useful when the progress of a reactive event depends not
 only on whether defects exist, but also on how far apart the corresponding
-sites are.
+sites are.  To locate a defect in a fixed frame, see
+[VORONOI_POSITION](VORONOI_POSITION.md).
 
 ## Definition and group semantics
 
@@ -1837,10 +1841,12 @@ $$
 $$
 
 The center-center distance $d_{ik}$ uses the minimum image unless NOPBC
-is specified.  CENTERS, ASSIGNED, KAPPA, REFERENCE, NOPBC, and NLIST have the
-same meaning as on the VORONOI_COORDINATION page.  NLIST truncates only the
-CENTER-ASSIGNED candidates used to construct the defects; it never removes
-GROUP1/GROUP2 center-center reduction pairs.
+is specified.  The coordination page explains the
+[common assignment inputs](VORONOI_COORDINATION.md#soft-assignment-and-coordination-defects),
+[neighbor-list options](VORONOI_COORDINATION.md#exact-and-neighbor-list-calculations),
+and [CPU and CUDA backends](VORONOI_COORDINATION.md#shared-and-cuda-assignment-backends).
+NLIST truncates the CENTER-ASSIGNED pairs used to compute defects.  The
+distance reduction still includes all pairs selected by GROUP1 and GROUP2.
 
 The product $q_iq_k$ emphasizes pairs of centers carrying correlated or
 complementary defects without assigning a permanent ion identity.  For one
@@ -1888,6 +1894,8 @@ weight.
 
 For one hydronium-hydroxide pair distributed over water oxygen atoms, unique
 pairs within WaterO describe the solution ion-ion separation.
+[Zhang and Xu (2025)](https://doi.org/10.1021/acs.langmuir.4c05004) used this
+separation together with defect activity to describe water autoionization.
 
 ```plumed
 UNITS LENGTH=A
@@ -1923,18 +1931,17 @@ water_to_N: VORONOI_DISTANCE CENTERS=Centers ASSIGNED=TransferableH KAPPA=5 REFE
 PRINT ARG=activity,water_to_O,water_to_N FILE=COLVAR
 ```
 
-If only one site is present, remove the other site from CENTERS and remove its
-matching REFERENCE entry.  No C++ change is required.
+If only one site is present, remove the unused site and its matching
+REFERENCE entry, then drop its distance Action and label from PRINT.
 
 ## Worked example 3: solvated glycine
 
-The glycine distance used in the paper cited below contains a water-glycine
-cross term and an internal N-O term.  Writing them separately removes the
-legacy `NRX` and last-three-atoms convention.  The numbered fixture below
-contains zwitterionic [Z] glycine, one complete water near its ammonium group,
-and one complete water near its carboxylate group.  Glycine C atoms and C-H
-atoms remain in the coordinate file to make the topology readable, but the
-non-transferable C-H atoms are excluded from ASSIGNED.
+The glycine distance used by
+[Zhang et al. (2024)](https://doi.org/10.1021/acs.jcim.4c00273) has a
+water-glycine cross term and an internal N-O term.  The downloadable
+[glycine-two-water.xyz](https://zhang-pchao.github.io/assets/reactive-voronoi/examples/glycine-two-water.xyz)
+structure contains zwitterionic [Z] glycine and one water near each end.
+ASSIGNED includes the transferable hydrogens and excludes glycine C-H atoms.
 
 ```plumed
 UNITS LENGTH=A
@@ -1959,10 +1966,11 @@ CENTERS expands to atoms `(1,4,7,15,16)`, so the five REFERENCE entries map to
 two water O atoms, glycine N, and two symmetry-related glycine O atoms.  The
 vector `(2,2,2,0.5,0.5)` declares the neutral [N] chemical origin even though
 the fixture is [Z].  An ideal [Z] frame therefore has defects near
-`(0,0,+1,-0.5,-0.5)`, and the seven references sum to the seven atoms in AllH.
-The complete full-pair fixture gives `sp=0.0073`, `sd_water=0.0354`
-$\mathrm{\AA}$, `sd_internal=2.9789` $\mathrm{\AA}$, and
-`sd=3.0143` $\mathrm{\AA}$.
+`(0,0,+1,-0.5,-0.5)`.  The five reference occupancies sum to the seven
+atoms in AllH.  To evaluate the fixture with [driver](driver.md), use
+`--length-units A --box 15.813,15.813,15.813`.  The full-pair outputs are
+approximately `sp=0.01`, `sd_water=0.04` angstroms, `sd_internal=2.98`
+angstroms, and `sd=3.01` angstroms.
 
 An alternative reference partition can accidentally give the same linear
 `sp` scalar when coefficients and total references cancel.  That does not
@@ -1970,12 +1978,14 @@ make it equivalent for VORONOI_DISTANCE, POWER=2, or sign filtering.  Use one
 physically declared reference vector consistently across the coupled Actions.
 The complete application is available in the
 [GlycineTautomerism repository](https://github.com/Zhang-pchao/GlycineTautomerism/tree/main/Enhanced_Sampling).
+For the effects of electric fields and interfaces on glycine tautomerism, see
+[Zhang and Xu (2025)](https://doi.org/10.1021/acs.jctc.5c00705).
 
 ## Worked example 4: nitrogen-reduction proton transfer
 
-The published Ru single-atom nitrogen-reduction input in
-Zhang et al. (2026) uses water oxygen atoms and one reactive nitrogen as the
-active Voronoi centers.  Catalyst and other adsorbate groups may appear in the
+The Ru single-atom nitrogen-reduction application of
+[B. Zhang et al. (2026)](https://doi.org/10.1039/D5TA09029F) uses water
+oxygen atoms and one reactive nitrogen as the active Voronoi centers.  Catalyst and other adsorbate groups may appear in the
 full simulation input, but they are not automatically active in these Actions.
 
 ```plumed
@@ -1993,8 +2003,7 @@ PRINT ARG=solvation,solution_ion_distance,site_ion_distance FILE=COLVAR
 
 The corresponding files are available in the
 [OPES-DPMD-NRR repository](https://github.com/Zhang-pchao/research/tree/main/OPES-DPMD-NRR).
-If the full input uses OPES, enable the optional module as described on the
-[VORONOI_COORDINATION](VORONOI_COORDINATION.md) page.
+The full [OPES_METAD](OPES_METAD.md) input requires the `opes` module.
 
 ## Troubleshooting
 
@@ -2028,6 +2037,9 @@ PLUMED_REGISTER_ACTION(VoronoiDistance,"VORONOI_DISTANCE")
 void VoronoiDistance::registerKeywords(Keywords& keys) {
   Colvar::registerKeywords(keys);
   keys.addDOI("10.1021/acs.jcim.4c00273");
+  keys.addDOI("10.1021/acs.langmuir.4c05004");
+  keys.addDOI("10.1021/acs.jctc.5c00705");
+  keys.addDOI("10.1039/D5TA09029F");
   registerCommonKeywords(keys);
   keys.add("atoms","GROUP1","First explicit subset of CENTERS");
   keys.add("atoms","GROUP2","Optional disjoint second subset of CENTERS; if omitted, unique pairs within GROUP1 are used");
@@ -2125,7 +2137,8 @@ coordination defect is located.  This Action weights the coordinates of the
 possible host centers by the smooth defects defined in
 [VORONOI_COORDINATION](VORONOI_COORDINATION.md).  It replaces atom-list-index
 moments with a physical Cartesian coordinate and provides analytical
-coordinate and box derivatives.
+coordinate and box derivatives.  To measure the separation between two
+defects, see [VORONOI_DISTANCE](VORONOI_DISTANCE.md).
 
 Legacy index-weighted observables such as $\sum_i i q_i^2$ depend on the
 order in which centers are listed: reordering chemically identical input can
@@ -2136,15 +2149,18 @@ VORONOI_POSITION coordinate when the spatial location of a defect is needed.
 
 ## Definition
 
-For selected centers $S$, Cartesian axis $\alpha$, and fixed origin
-$x_0$, define the displacement
+SELECT defines the set of centers $S$.  AXIS gives the Cartesian component
+$\alpha$, and ORIGIN gives its fixed reference coordinate $x_0$.  Let
+$\mathbf{r}_i^{(0)}$ be the projection of center $i$ onto the origin plane,
+with its other coordinates unchanged.  The periodic displacement is
 
 $$
- u_i=\operatorname{minimage}(x_{i,\alpha}-x_0)
+ u_i=\left[\operatorname{minimage}
+ \left(\mathbf{r}_i-\mathbf{r}_i^{(0)}\right)\right]_\alpha ,
 $$
 
-when periodic boundaries are active.  NOPBC replaces it by the direct
-Cartesian difference.  The unnormalized Action is
+where $\mathbf{r}_i$ is the center position.  With NOPBC, the displacement
+is the direct difference $x_{i,\alpha}-x_0$.  The unnormalized Action is
 
 $$
  P=\sum_{i\in S}g(q_i)f(u_i),
@@ -2157,7 +2173,7 @@ $f(u)=|u|$ with ABSOLUTE.  SELECT defaults to all CENTERS.
 With NORMALIZE, the returned value is
 
 $$
- \bar P=\frac{\sum_i g(q_i)f(u_i)}{\sum_i g(q_i)}.
+ \bar P=\frac{\sum_{i\in S} g(q_i)f(u_i)}{\sum_{i\in S} g(q_i)}.
 $$
 
 The unnormalized form naturally approaches zero in a neutral configuration
@@ -2191,7 +2207,7 @@ analytically.  Box derivatives use the same periodic images as the value.
 This makes the Action usable as a bias coordinate within its declared smooth
 region, but the following surfaces require special care:
 
-1. the minimum-image branch at half the periodic cell length;
+1. a change of minimum image (at half a box length in an orthorhombic cell);
 2. the ABSOLUTE cusp at ORIGIN;
 3. the second-derivative cusp where a sign-selected defect changes sign;
 4. an NLIST membership change;
@@ -2215,16 +2231,19 @@ unwrap trajectories or locate an instantaneous interface.  NOPBC removes the
 minimum-image mapping but does not by itself make wrapped molecular-dynamics
 coordinates continuous.
 
-NLIST has the same approximate normalization and convergence requirements as
-[VORONOI_COORDINATION](VORONOI_COORDINATION.md).  Position values can magnify
-small assignment errors through the distance from ORIGIN, so converge both
-the CV and its derivatives against full-pair mode.
+The coordination page explains the
+[common assignment inputs](VORONOI_COORDINATION.md#soft-assignment-and-coordination-defects),
+[neighbor-list options](VORONOI_COORDINATION.md#exact-and-neighbor-list-calculations),
+and [CPU and CUDA backends](VORONOI_COORDINATION.md#shared-and-cuda-assignment-backends).
+Position values can magnify small assignment errors through the distance
+from ORIGIN.  Converge the CV and its derivatives against full-pair mode.
 
 ## Worked example 1: water self-ions at an interface
 
 For a slab normal to $z$, positive and negative defects can be monitored
-relative to a fixed reference plane.  The unnormalized form below remains
-defined in neutral configurations.
+relative to a fixed plane.  [Zhang and Xu (2025)](https://doi.org/10.1021/acs.langmuir.4c05004)
+used this approach to track water self-ions at interfaces.  The unnormalized
+form below remains defined in neutral configurations.
 
 ```plumed
 UNITS LENGTH=A
@@ -2255,9 +2274,9 @@ h3o_signed_z: VORONOI_POSITION CENTERS=WaterO ASSIGNED=WaterH KAPPA=5 REFERENCE=
 PRINT ARG=h3o_signed_z FILE=COLVAR
 ```
 
-Do not use this normalized form in a trajectory that can become neutral.  In
-that case the fail-closed TOLERANCE error is expected; use the unnormalized
-form or a separately justified state-dependent workflow.
+Use the unnormalized form when recombination is allowed.  Near a neutral
+state the normalization denominator can become too small to give a stable
+position.
 
 ## Worked example 3: restrict hosts while retaining a reactive site
 
@@ -2278,10 +2297,9 @@ PRINT ARG=water_positive_z FILE=COLVAR
 ```
 
 The air-water and oil-water applications are available in the
-[OilWaterInterface repository](https://github.com/Zhang-pchao/OilWaterInterface/tree/main)
-and are described in Zhang et al. (2025).  Historical NL_CUTOFF,
-NL_STRIDE, and ORIGIN values are system-specific and should not be copied
-without new full-pair and reference-frame validation.
+[OilWaterInterface repository](https://github.com/Zhang-pchao/OilWaterInterface/tree/main).
+Choose NL_CUTOFF, NL_STRIDE, and ORIGIN for the target system and validate
+against the full-pair calculation in the intended reference frame.
 
 ## Validation checklist and troubleshooting
 
@@ -2324,6 +2342,7 @@ PLUMED_REGISTER_ACTION(VoronoiPosition,"VORONOI_POSITION")
 
 void VoronoiPosition::registerKeywords(Keywords& keys) {
   Colvar::registerKeywords(keys);
+  keys.addDOI("10.1021/acs.langmuir.4c05004");
   registerCommonKeywords(keys);
   keys.add("atoms","SELECT","Subset of CENTERS included in the position; the default is all centers");
   keys.add("compulsory","AXIS","Cartesian axis X, Y, or Z");
